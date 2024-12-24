@@ -6,8 +6,7 @@
 #include <linux/init.h>
 #include <linux/ip.h>
 #include <linux/types.h>
-#include <linux/rhashtable.h>
-#include <linux/etherdevice.h> 
+#include <traffic_logger.h>
 
 static struct nf_hook_ops nf_netdev_hook;
 static int32_t whitelist_proto[65536] = {
@@ -19,6 +18,14 @@ static int32_t whitelist_proto[65536] = {
     [ETH_P_BATMAN] = 1,
     [ETH_P_LLDP] = 1,
 };//2 bytes sacrifised for O(1) whitelist
+
+const static struct rhashtable_params object_params = {
+	.key_len     = sizeof(uint32_t),
+	.key_offset  = offsetof(struct mac_info, key),
+	.head_offset = offsetof(struct mac_info, linkage),
+};
+
+static struct rhashtable frames_info;
 
 unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state) {
     struct ethhdr* pHdr = eth_hdr(skb);  
@@ -32,7 +39,7 @@ unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct n
         return NF_ACCEPT;//skipping uninterested packet O(1)
     }
 
-    unsigned char source_mac[6];
+    unsigned char source_mac[ETH_ALEN];
     memcpy(source_mac, pHdr->h_source, ETH_ALEN);
     uint32_t hash = jhash(source_mac, ETH_ALEN, 0);
 
@@ -55,6 +62,11 @@ static void init_hook(struct nf_hook_ops *nfho,
 }
 
 static int __init logger_init(void) {
+    uint32_t result = rhashtable_init(&my_objects, &object_params);
+    if(!result) {
+        printk(KERN_ERR "Error initing hashtable in logger_init\n");
+        return -EINVAL;
+    }
     init_hook(&nf_netdev_hook, traffic_netdev_hook, NFPROTO_NETDEV, NF_NETDEV_INGRESS, NF_IP_PRI_FIRST);
 
     printk(KERN_INFO "Traffic logger module loaded.\n");
