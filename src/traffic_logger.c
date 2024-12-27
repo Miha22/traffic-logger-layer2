@@ -5,16 +5,23 @@
 #include <linux/skbuff.h>
 #include <linux/init.h>
 #include <linux/types.h>
+#include <linux/kfifo.h>
+#include <linux/spinlock.h>
+#include <linux/buffer.h>
 #include <traffic_logger.h>
-#include <linux/circ_buf.h>
 #include <linux/slab.h>
 
-#define BUF_SIZE 1024
+#define WHITELIST_SIZE 65536
+#define BUF_SIZE 1000
+#define BATCH_SIZE 100
+DECLARE_KFIFO(packet_mem_stack, void *, BUF_SIZE);
 
 static struct kmem_cache *packet_cache;
+static spinlock_t kfifo_slock;
+
 static struct nf_hook_ops nf_netdev_hook;
 static struct rhashtable frames_info;
-static int32_t whitelist_proto[65536] = {
+static int32_t whitelist_proto[WHITELIST_SIZE] = {
     [ETH_P_IP] = 1,
     [ETH_P_IPV6] = 1,
     [ETH_P_ARP] = 1,
@@ -22,7 +29,7 @@ static int32_t whitelist_proto[65536] = {
     [ETH_P_MPLS_UC] = 1,
     [ETH_P_BATMAN] = 1,
     [ETH_P_LLDP] = 1,
-};//2 bytes sacrifised for O(1) whitelist
+};
 
 const static struct rhashtable_params object_params = {
 	.key_len     = sizeof(uint32_t),
@@ -59,30 +66,75 @@ int init_packet_cache(void) {
     return 1;
 }
 
+int init_packet_memory(void) {
+    if(packet_cache == NULL) {
+        printk(KERN_ERR "Cache must be initialized first\n");
+        return -EPERM;
+    }
+    int ret = kfifo_alloc(&packet_mem_stack, BUF_SIZE, GFP_KERNEL); 
+    if (ret < 0) {
+        printk(KERN_ERR "Failed to allocate memory for kfifo\n");
+        return ret;
+    }
+
+    spin_lock_init(&kfifo_slock);
+
+    for(uint16_t i = 0; i < BUF_SIZE; i++) {
+        struct packet_info *p_info = new_packet_info();
+        kfifo_in(&packet_mem_stack, p_info, 1); 
+    }
+
+    return 1;
+}
+
+void* get_packet_mem(void) {
+    struct packet_info *p_info = NULL;
+
+    spin_lock(&kfifo_slock);
+    if (!kfifo_is_empty(&packet_mem_stack)) {
+        kfifo_out(&packet_mem_stack, &p_info, 1);
+    }
+    spin_unlock(&kfifo_slock);
+
+    if (!p_info) {
+        printk(KERN_ERR "[BUF_FULL] Failed to allocate memory for incoming packet, skipping\n");
+    }
+
+    return p_info;
+}
+
+int free_packet_mem(void* packet_ptr) {
+    spin_lock(&kfifo_slock);
+    if (!kfifo_is_full(&packet_mem_stack)) {
+        kfifo_in(&packet_mem_stack, &packet_ptr, 1);
+    } else {
+        printk(KERN_ERR "stack overflow in free_packet_mem\n");
+    }
+    spin_unlock(&kfifo_slock);
+}
+
 unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state) {
     struct ethhdr* eth_h = eth_hdr(skb);
     struct iphdr *ip_h = ip_hdr(skb);  
 
     if(!eth_h || !ip_h) {
-        printk(KERN_INFO "failed to capture ethernet or ip header in traffic_logger module.");
+        printk(KERN_INFO "failed to capture ethernet or ip header in traffic_logger module\n");
         return NF_ACCEPT;
     }
-    uint32_t proto_hs = ntohs(eth->h_proto);
 
+    uint32_t proto_hs = ntohs(eth->h_proto);
     if(!whitelist_proto[proto_hs]) {
         return NF_ACCEPT;//skipping uninterested packet O(1)
     }
 
-    struct packet_info *packet_info = new_packet_info();
-    if (!packet_info) {
-        printk(KERN_ERR "slab memory allocation failed in netfilter hook\n");
+    struct packet_info *p_info = (struct packet_info *)get_packet_mem();
+    if(p_info == NULL) {
+        printk(KERN_ERR "[BUF_FULL] failed to allocate memory for incoming packet, skipping\n");
         return NF_ACCEPT;
     }
+    memcpy(&p_info->eth_h, eth_h, sizeof(struct ethhdr));
+    memcpy(&p_info->ip_h, ip_h, sizeof(struct iphdr));
 
-    memcpy(&packet_info->eth_h, eth_h, sizeof(struct ethhdr));
-    memcpy(&packet_info->ip_h, ip_h, sizeof(struct iphdr));
-
-    //slab
 
 
     return NF_ACCEPT;
@@ -108,8 +160,13 @@ static void init_hook(struct nf_hook_ops *nfho,
 }
 
 static int __init logger_init(void) {
-    uint32_t result = rhashtable_init(&my_objects, &object_params);
-    if(!result) {
+    if (init_packet_cache() < 0) {
+        return -EINVAL;
+    }
+    if (init_packet_memory() < 0) {
+        return -EINVAL;
+    }
+    if(!rhashtable_init(&my_objects, &object_params)) {
         printk(KERN_ERR "Error initing hashtable in logger_init\n");
         return -EINVAL;
     }
@@ -121,7 +178,11 @@ static int __init logger_init(void) {
 }
 
 static void __exit logger_exit(void) {
-
+    for(uint16_t i = 0; i < stack_top + 1; i++) {
+        free_packet(packet_mem_stack[i]);
+    }
+    cleanup_packet_cache();
+    kfifo_free(&packet_mem_stack);
     printk(KERN_INFO "Traffic logger module UNloaded.\n");
 }
 
