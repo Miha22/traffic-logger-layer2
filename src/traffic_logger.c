@@ -1,20 +1,25 @@
 #include <linux/module.h>
+#include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/types.h>
+
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/skbuff.h>
-#include <linux/init.h>
-#include <linux/types.h>
+
+#include <linux/slab.h>
+#include <linux/percpu.h>
+#include <linux/kfifo.h>
 #include <linux/kfifo.h>
 #include <linux/spinlock.h>
+
 #include <linux/buffer.h>
 #include <traffic_logger.h>
-#include <linux/slab.h>
 
 #define WHITELIST_SIZE 65536
 #define BUF_SIZE 1000
 #define BATCH_SIZE 100
-DECLARE_KFIFO(packet_mem_stack, void *, BUF_SIZE);
+DEFINE_PER_CPU(struct kfifo, packet_mem_stack);
 
 static struct kmem_cache *packet_cache;
 static spinlock_t kfifo_slock;
@@ -71,46 +76,51 @@ int init_packet_memory(void) {
         printk(KERN_ERR "Cache must be initialized first\n");
         return -EPERM;
     }
-    int ret = kfifo_alloc(&packet_mem_stack, BUF_SIZE, GFP_KERNEL); 
-    if (ret < 0) {
-        printk(KERN_ERR "Failed to allocate memory for kfifo\n");
-        return ret;
-    }
-
-    spin_lock_init(&kfifo_slock);
-
-    for(uint16_t i = 0; i < BUF_SIZE; i++) {
-        struct packet_info *p_info = new_packet_info();
-        kfifo_in(&packet_mem_stack, p_info, 1); 
+    int cpu, ret;
+    for_each_possible_cpu(cpu) {
+        struct kfifo *stack = &per_cpu(packet_mem_stack, cpu);
+        ret = kfifo_alloc(stack, BUF_SIZE, GFP_KERNEL);
+        if (ret) {
+            printk(KERN_ERR "Failed to allocate kfifo per CPU:%d\n", cpu);
+            return -ENOMEM;
+        }
+        for(uint16_t i = 0; i < BUF_SIZE; i++) {
+            struct packet_info *p_info = new_packet_info();
+            kfifo_in(stack, p_info, 1); 
+        }
     }
 
     return 1;
 }
 
-void* get_packet_mem(void) {
+void* get_packet_mem(struct kfifo *stack) {
     struct packet_info *p_info = NULL;
 
-    spin_lock(&kfifo_slock);
-    if (!kfifo_is_empty(&packet_mem_stack)) {
-        kfifo_out(&packet_mem_stack, &p_info, 1);
+    if (!kfifo_is_empty(stack)) {
+        kfifo_out(stack, &p_info, 1);
     }
-    spin_unlock(&kfifo_slock);
 
     if (!p_info) {
         printk(KERN_ERR "[BUF_FULL] Failed to allocate memory for incoming packet, skipping\n");
+        return NULL;
     }
 
     return p_info;
 }
 
-int free_packet_mem(void* packet_ptr) {
-    spin_lock(&kfifo_slock);
-    if (!kfifo_is_full(&packet_mem_stack)) {
-        kfifo_in(&packet_mem_stack, &packet_ptr, 1);
-    } else {
-        printk(KERN_ERR "stack overflow in free_packet_mem\n");
+int free_packet_mem(struct kfifo *stack, void* packet_ptr) {
+      if (!packet_ptr) {
+        printk(KERN_ERR "packet_ptr is NULL\n");
+        return -EINVAL;
     }
-    spin_unlock(&kfifo_slock);
+    if (!kfifo_is_full(stack)) {
+        kfifo_in(stack, packet_ptr, 1);
+    } else {
+        printk(KERN_ERR "stack overflow in returning memory back to stack\n");
+        return -ENOMEM;
+    }
+
+    return 1;
 }
 
 unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state) {
@@ -127,15 +137,16 @@ unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct n
         return NF_ACCEPT;//skipping uninterested packet O(1)
     }
 
-    struct packet_info *p_info = (struct packet_info *)get_packet_mem();
-    if(p_info == NULL) {
+    int cpu = smp_processor_id();
+    struct kfifo *cpu_stack = &per_cpu(packet_mem_stack, cpu);
+    struct packet_info *p_info = (struct packet_info *)get_packet_mem(stack);
+
+    if(!p_info) {
         printk(KERN_ERR "[BUF_FULL] failed to allocate memory for incoming packet, skipping\n");
         return NF_ACCEPT;
     }
     memcpy(&p_info->eth_h, eth_h, sizeof(struct ethhdr));
     memcpy(&p_info->ip_h, ip_h, sizeof(struct iphdr));
-
-
 
     return NF_ACCEPT;
 }
@@ -178,11 +189,13 @@ static int __init logger_init(void) {
 }
 
 static void __exit logger_exit(void) {
-    for(uint16_t i = 0; i < stack_top + 1; i++) {
-        free_packet(packet_mem_stack[i]);
+    int cpu;
+
+    for_each_possible_cpu(cpu) {
+        struct kfifo *stack = &per_cpu(packet_mem_stack, cpu);
+        kfifo_free(stack);
     }
     cleanup_packet_cache();
-    kfifo_free(&packet_mem_stack);
     printk(KERN_INFO "Traffic logger module UNloaded.\n");
 }
 
