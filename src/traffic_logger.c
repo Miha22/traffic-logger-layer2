@@ -8,24 +8,33 @@
 #include <linux/skbuff.h>
 
 #include <linux/slab.h>
+#include <linux/workqueue.h>  
 #include <linux/percpu.h>
 #include <linux/kfifo.h>
-#include <linux/kfifo.h>
-#include <linux/spinlock.h>
 
-#include <linux/buffer.h>
+#include <linux/spinlock.h>
+#include <linux/rwsem.h>
+#include <linux/wait.h>
+
+#include <linux/buffer.h>s
 #include <traffic_logger.h>
 
 #define WHITELIST_SIZE 65536
 #define BUF_SIZE 1000
 #define BATCH_SIZE 100
-DEFINE_PER_CPU(struct kfifo, packet_mem_stack);
 
-static struct kmem_cache *packet_cache;
-static spinlock_t kfifo_slock;
-
-static struct nf_hook_ops nf_netdev_hook;
 static struct rhashtable frames_info;
+static struct kmem_cache *packet_cache;
+static struct nf_hook_ops nf_netdev_hook;
+static DECLARE_RWSEM(htable_semaphore);
+static DEFINE_PER_CPU(struct kfifo, packet_mem_stack);
+static DEFINE_PER_CPU(atomic_t, batch_counter);
+static struct work_struct update_table_work;
+static DECLARE_WAIT_QUEUE_HEAD(w_wait_queue);
+atomic_t dumping_hashtable = ATOMIC_INIT(0);
+//wake_up_all(&w_wait_queue); //notifyAll()
+//wait_event(w_wait_queue, atomic_read(&dumping_hashtable) == 0);//thread.sleep()
+
 static int32_t whitelist_proto[WHITELIST_SIZE] = {
     [ETH_P_IP] = 1,
     [ETH_P_IPV6] = 1,
@@ -71,13 +80,16 @@ int init_packet_cache(void) {
     return 1;
 }
 
-int init_packet_memory(void) {
+int init_packet_memory(void) {//and batch_counter
     if(packet_cache == NULL) {
         printk(KERN_ERR "Cache must be initialized first\n");
         return -EPERM;
     }
     int cpu, ret;
     for_each_possible_cpu(cpu) {
+        atomic_t *b_counter = &per_cpu(batch_counter, cpu);
+        *b_counter = ATOMIC_INIT(0);
+
         struct kfifo *stack = &per_cpu(packet_mem_stack, cpu);
         ret = kfifo_alloc(stack, BUF_SIZE, GFP_KERNEL);
         if (ret) {
@@ -93,7 +105,7 @@ int init_packet_memory(void) {
     return 1;
 }
 
-void* get_packet_mem(struct kfifo *stack) {
+void* get_packet_memory(struct kfifo *stack) {
     struct packet_info *p_info = NULL;
 
     if (!kfifo_is_empty(stack)) {
@@ -138,8 +150,9 @@ unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct n
     }
 
     int cpu = smp_processor_id();
-    struct kfifo *cpu_stack = &per_cpu(packet_mem_stack, cpu);
-    struct packet_info *p_info = (struct packet_info *)get_packet_mem(stack);
+    atomic_t *local_bcounter = &per_cpu(batch_counter, cpu);
+    struct kfifo *local_stack = &per_cpu(packet_mem_stack, cpu);
+    struct packet_info *p_info = (struct packet_info *)get_packet_memory(local_stack);
 
     if(!p_info) {
         printk(KERN_ERR "[BUF_FULL] failed to allocate memory for incoming packet, skipping\n");
@@ -147,6 +160,13 @@ unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct n
     }
     memcpy(&p_info->eth_h, eth_h, sizeof(struct ethhdr));
     memcpy(&p_info->ip_h, ip_h, sizeof(struct iphdr));
+
+    atomic_inc(local_bcounter);
+    int counter = atomic_read(local_bcounter);
+    if(counter == BATCH_SIZE) {
+        atomic_set(local_bcounter, 0);
+        //start workqueue
+    }
 
     return NF_ACCEPT;
 }
