@@ -29,7 +29,8 @@ static struct nf_hook_ops nf_netdev_hook;
 static DECLARE_RWSEM(htable_semaphore);
 static DEFINE_PER_CPU(struct kfifo, packet_mem_stack);
 static DEFINE_PER_CPU(atomic_t, batch_counter);
-static struct work_struct update_table_work;
+static DECLARE_PER_CPU(struct workqueue_struct *, percpu_workqueue);
+static DECLARE_PER_CPU(struct work_struct[BUF_SIZE / BATCH_SIZE], wq_workers);
 static DECLARE_WAIT_QUEUE_HEAD(w_wait_queue);
 atomic_t dumping_hashtable = ATOMIC_INIT(0);
 //wake_up_all(&w_wait_queue); //notifyAll()
@@ -80,13 +81,21 @@ int init_packet_cache(void) {
     return 1;
 }
 
-int init_packet_memory(void) {//and batch_counter
+int init_per_cpu(void) {
     if(packet_cache == NULL) {
         printk(KERN_ERR "Cache must be initialized first\n");
         return -EPERM;
     }
     int cpu, ret;
     for_each_possible_cpu(cpu) {
+        struct workqueue_struct *wq = alloc_workqueue("percpu_wq_%d", WQ_UNBOUND, 0, cpu);
+        if (!wq) {
+            printk(KERN_ERR "Failed to allocate workqueue for CPU %d\n", cpu);
+            return -ENOMEM;
+        }
+        struct workqueue_struct **wq_ptr = &per_cpu(percpu_workqueue, cpu);
+        *wq_ptr = wq;
+
         atomic_t *b_counter = &per_cpu(batch_counter, cpu);
         *b_counter = ATOMIC_INIT(0);
 
@@ -150,10 +159,11 @@ unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct n
     }
 
     int cpu = smp_processor_id();
+    struct workqueue_struct wq_ptr* = per_cpu(percpu_workqueue, cpu);
     atomic_t *local_bcounter = &per_cpu(batch_counter, cpu);
     struct kfifo *local_stack = &per_cpu(packet_mem_stack, cpu);
-    struct packet_info *p_info = (struct packet_info *)get_packet_memory(local_stack);
 
+    struct packet_info *p_info = (struct packet_info *)get_packet_memory(local_stack);
     if(!p_info) {
         printk(KERN_ERR "[BUF_FULL] failed to allocate memory for incoming packet, skipping\n");
         return NF_ACCEPT;
@@ -163,9 +173,9 @@ unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct n
 
     atomic_inc(local_bcounter);
     int counter = atomic_read(local_bcounter);
-    if(counter == BATCH_SIZE) {
+    if(counter >= BATCH_SIZE) {
         atomic_set(local_bcounter, 0);
-        //start workqueue
+        
     }
 
     return NF_ACCEPT;
@@ -194,7 +204,7 @@ static int __init logger_init(void) {
     if (init_packet_cache() < 0) {
         return -EINVAL;
     }
-    if (init_packet_memory() < 0) {
+    if (init_per_cpu() < 0) {
         return -EINVAL;
     }
     if(!rhashtable_init(&my_objects, &object_params)) {
