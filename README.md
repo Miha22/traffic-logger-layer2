@@ -24,6 +24,8 @@ static int32_t whitelist_proto[65536] = {
     [ETH_P_LLDP] = 1,
 };
 ```
+#### **[UPD. 30.12.2024]**
+little did I know...
 #### **[UPD. 23.12.2024]**
 Later I might consider checking eth_hdr's protocol **ETH_P_ALL** to capture all ethernet procols and loggin them, but that might overwhelm the system. There is a need to decrease the load by filtering out irrelevant protocols traffic such as loopback frames, slow protocol frames, 802 vlan frames, experimental, deprecated etc. 
 

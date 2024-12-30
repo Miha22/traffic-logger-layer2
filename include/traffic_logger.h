@@ -4,6 +4,8 @@
 #include <linux/etherdevice.h>
 #include <linux/ip.h> 
 
+#define BUF_SIZE 1000
+
 struct data_info {
 	uint32_t key;
     char mac_s[ETH_ALEN];
@@ -20,7 +22,19 @@ struct data_block {
 	__be32 dst_ip;
 };
 
+struct ring_buffer {
+    void *buffer[BUF_SIZE];
+    uint32_t head;
+    uint32_t tail;
+	uint32_t head_initial;
+};
+
 struct packet_info {
 	struct ethhdr eth_h;
 	struct iphdr ip_h;
 }
+
+struct work_info {
+    struct work_struct work;
+    int cpu_id;
+};
