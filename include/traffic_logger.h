@@ -22,13 +22,6 @@ struct data_block {
 	__be32 dst_ip;
 };
 
-struct ring_buffer {
-    void *buffer[BUF_SIZE];
-    uint32_t head;
-    uint32_t tail;
-	uint32_t head_initial;
-};
-
 struct packet_info {
 	struct ethhdr eth_h;
 	struct iphdr ip_h;

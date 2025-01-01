@@ -1,10 +1,11 @@
 #include <linux/types.h>
 #include <traffic_logger.h>
 
-#define BUFFER_SIZE 1000
+#define BUF_SIZE 1000
 
-// struct circ_buffer {
-//     struct packet_info *buffer[BUFFER_SIZE];
-//     atomic_t head;
-//     atomic_t tail;
-// }
+struct ring_buffer {
+    void *buffer[BUF_SIZE];
+    uint32_t head;
+    uint32_t tail;
+	uint32_t head_initial;
+};
