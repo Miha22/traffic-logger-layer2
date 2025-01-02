@@ -7,5 +7,4 @@ struct ring_buffer {
     void *buffer[BUF_SIZE];
     uint32_t head;
     uint32_t tail;
-	uint32_t head_initial;
 };

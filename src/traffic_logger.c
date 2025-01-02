@@ -15,7 +15,7 @@
 #include <linux/rwsem.h>
 #include <linux/wait.h>
 
-#include <linux/buffer.h>s
+#include <buffer.h>s
 #include <traffic_logger.h>
 
 #define WHITELIST_SIZE 65536
@@ -93,7 +93,7 @@ int enqueue_circ_buf(struct ring_buffer *rb, void *data) {
 
 void* dequeue_circ_buf(struct ring_buffer *rb) {
     if(rb->head == rb->tail) {
-        printk(KERN_WARNING "[head]ring buffer is empty, cannot denqueue data\n");
+        printk(KERN_WARNING "[head]ring buffer is empty, cannot dequeue data\n");
         return NULL;
     }
     void* data = rb->buffer[rb->head];
@@ -108,12 +108,15 @@ int wq_process_batch(struct work_struct *work) {
     int cpu_id = w_info->cpu_id;
 
     struct ring_buffer *rb = &per_cpu(percpu_circ_buf, cpu_id);
+    uint32_t start_index = rb->head;
+    void* b = rb->buffer;
 
-    for(uint16_t i = 0; i < BUF_SIZE; i++) {
-        struct packet_info *p_info = dequeue_circ_buf(rb);//return packet_info back to ring buffer that was just read now
+    for(uint16_t i = start_index; i < BUF_SIZE; i++) {
+        struct packet_info *p_info = (struct packet_info *)b[i];
         unsigned char source_mac[ETH_ALEN];
         memcpy(source_mac, p_info->eth_h.h_source, ETH_ALEN);
         uint32_t hash = jhash(source_mac, ETH_ALEN, 0);
+        int res = enqueue_circ_buf(rb, p_info);//return memory back for new write (new packet_info will overwrite)
     }
 }
 
@@ -141,9 +144,6 @@ int init_per_cpu(void) {
         atomic_t *b_counter = &per_cpu(batch_counter, cpu);
         *b_counter = ATOMIC_INIT(0);
 
-        spinlock_t *s_lock = &per_cpu(stack_lock, cpu);
-        spin_lock_init(s_lock);
-
         struct ring_buffer *rb = &per_cpu(percpu_circ_buf, cpu);
         for(uint16_t i = 0; i < BUF_SIZE; i++) {
             struct packet_info *p_info = allocate_packet_cache();
@@ -157,32 +157,6 @@ int init_per_cpu(void) {
 
     return 1;
 }
-
-//[REPLACED with dequeue_circ_buf()]
-// struct packet_info *get_packet_memory(struct ring_buffer *rb) {
-//     struct packet_info *p_info = (struct packet_info *)dequeue_circ_buf(rb);
-
-//     if (p_info == NULL) {
-//         printk(KERN_WARNING "[BUF_EMPTY_NOT_ALLOCATED] Failed to place incoming packet into memory\n");
-//         return NULL;
-//     }
-
-//     return p_info;
-// }
-//[REPLACED with enqueue_circ_buf()]
-// int return_packet_memory(struct ring_buffer *rb, void* p_info) {
-//     if (!packet_ptr) {
-//         printk(KERN_ERR "packet_ptr is NULL\n");
-//         return -EINVAL;
-//     }
-//     int res = enqueue_circ_buf(rb, p_info);
-//     if (res < 0) {
-//         printk(KERN_ERR "stack overflow in returning memory back to stack\n");
-//         return -ENOMEM;
-//     }
-
-//     return 1;
-// }
 
 unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state) {
     struct ethhdr* eth_h = eth_hdr(skb);
@@ -204,10 +178,10 @@ unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct n
     atomic_t *packet_counter = &per_cpu(batch_counter, cpu);
     struct ring_buffer *rb = &per_cpu(percpu_circ_buf, cpu);
 
-    int counter = atomic_read(packet_counter);
-    if(counter == 0) {
-        rb->head_initial = rb->head;
-    }
+    // int counter = atomic_read(packet_counter);
+    // if(counter == 0) {
+    //     rb->head_initial = rb->head;
+    // }
 
     //assembling batch
     struct packet_info *p_info = (struct packet_info *)dequeue_circ_buf(rb);
@@ -221,7 +195,6 @@ unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct n
     atomic_inc(packet_counter);
     counter = atomic_read(packet_counter);
     if(counter == BATCH_SIZE) {
-        rb->head = rb->head_initial;//for workqueue to work correctly from the beginning of filled packet_info (-s)
         atomic_set(packet_counter, 0);
         //allocate for any next free worker, will use kfifo stack for that.
         queue_work(wq_ptr, &local_workers[0].work);//test
