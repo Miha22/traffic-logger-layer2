@@ -15,13 +15,13 @@
 #include <linux/rwsem.h>
 #include <linux/wait.h>
 
-#include <buffer.h>s
+#include <buffer.h>
 #include <traffic_logger.h>
 
 #define WHITELIST_SIZE 65536
 
 static struct rhashtable rhash_frames;
-static struct rhashtable rhash_frames_copy;
+static struct mac_list *mac_list;//mac strings to dump
 DECLARE_WORK(rhash_worker, wq_process_dump);
 static struct kmem_cache *packet_cache;
 static struct nf_hook_ops nf_netdev_hook;
@@ -120,7 +120,7 @@ static void* dequeue_circ_buf(struct ring_buffer *rb) {
 }
 
 static int wq_process_dump(struct work_struct *work) { 
-
+    //dump into proc filesystem
 
     return 0;
 }
@@ -134,19 +134,14 @@ void dump_htable(void) {
     
     rhashtable_walk_enter(&frames_info, &iter);
     rhashtable_walk_start(&iter);
-
-    while ((obj = (struct mac_info*)rhashtable_walk_next(&iter)) != NULL) {
+    uint32_t i = 0;
+    while (i < BUF_SIZE && (obj = (struct mac_info*)rhashtable_walk_next(&iter)) != NULL) {
         if (IS_ERR(obj))
             continue;
-
-        struct mac_info *new_obj = kmalloc(sizeof(struct mac_info), GFP_ATOMIC);
-        if (!new_obj) {
-            printk(KERN_ERR "Failed to allocate memory for snapshot\n");
-            break;
-        }
-
-        memcpy(new_obj, obj, sizeof(struct mac_info));
-        rhashtable_insert_fast(&rhash_frames_copy, &new_obj->linkage, object_params);
+        
+        //memcpy(mac_arr_d[i], obj->src_mac, ETH_ALEN);
+        snprintf(mac_arr_d[i], MAC_SIZE, "%pM", obj->src_mac);
+        i++;
     }
 
     rhashtable_walk_stop(&iter);
@@ -347,7 +342,25 @@ static void init_hook(struct nf_hook_ops *nfho,
     nfho->priority = priority;
 }
 
+
 static int __init logger_init(void) {
+    mac_list = (struct mac_list *)kmalloc(sizeof(struct mac_list), GFP_KERNEL);
+    if(!mac_list) {
+        printk(KERN_ERR "Failed to allocate memory for mac list[%d]\n", i);
+        return -ENOMEM; 
+    }
+    for (int i = 0; i < BUF_SIZE; i++) {
+        mac_list->arr[i] = kmalloc(ETH_ALEN, GFP_KERNEL);
+        if (mac_list->arr[i] == NULL) {
+            printk(KERN_ERR "Failed to allocate memory for mac_arr_d[%d]\n", i);
+            for (int j = 0; j < i; j++) {
+                kfree(mac_list->arr[j]);
+            }
+            kfree(mac_list);
+            return -ENOMEM; 
+        }
+    }
+
     if (init_packet_cache() < 0) {
         return -EINVAL;
     }
@@ -381,7 +394,12 @@ static void __exit logger_exit(void) {
         destroy_workqueue(per_cpu(percpu_workqueue, cpu));
     }
     destroy_packet_cache();
-    printk(KERN_INFO "Traffic logger module UNloaded.\n");
+
+    for (int i = 0; i < BUF_SIZE; i++) {
+        kfree(mac_list->arr[i]);
+    }
+    kfree(mac_list);
+    printk(KERN_INFO "Traffic logger module Unloaded.\n");
 }
 
 module_init(logger_init);
