@@ -20,19 +20,20 @@
 
 #define WHITELIST_SIZE 65536
 
-static struct rhashtable frames_info;
+static struct rhashtable rhash_frames;
+static struct rhashtable rhash_frames_copy;
+DECLARE_WORK(rhash_worker, wq_process_dump);
 static struct kmem_cache *packet_cache;
 static struct nf_hook_ops nf_netdev_hook;
-static DECLARE_RWSEM(htable_semaphore);
+static DEFINE_RWLOCK(rhash_rwlock);
+static DECLARE_WAIT_QUEUE_HEAD(writers_wq);
+static atomic_t reader_waiting = ATOMIC_INIT(0);//prioritized reader for periodic dumping
 static DEFINE_PER_CPU(struct ring_buffer, percpu_circ_buf);
 static DEFINE_PER_CPU(atomic_t, batch_counter);
 static DECLARE_PER_CPU(struct workqueue_struct *, percpu_workqueue);
 static DECLARE_PER_CPU(struct work_info[WORKERS_SIZE], wq_workers);
 static DEFINE_PER_CPU(struct kfifo, worker_stack);
-static DECLARE_WAIT_QUEUE_HEAD(w_wait_queue);
-static atomic_t dumping_hashtable = ATOMIC_INIT(0);
-//wake_up_all(&w_wait_queue); //notifyAll()
-//wait_event(w_wait_queue, atomic_read(&dumping_hashtable) == 0);//thread.sleep()
+static DEFINE_PER_CPU(spinlock_t, kfifo_slock);
 
 static int32_t whitelist_proto[WHITELIST_SIZE] = {
     [ETH_P_IP] = 1,
@@ -56,7 +57,6 @@ static int mac_obj_cmpfn(struct rhashtable_compare_arg *arg, const void *obj)
 
     return memcmp(key, mi->src_mac, ETH_ALEN);
 }
-
 
 const static struct rhashtable_params object_params = {
 	.key_len     = ETH_ALEN,
@@ -119,18 +119,70 @@ static void* dequeue_circ_buf(struct ring_buffer *rb) {
     return data;
 }
 
+static int wq_process_dump(struct work_struct *work) { 
+
+
+    return 0;
+}
+
+void dump_htable(void) {
+    struct rhashtable_iter iter;
+    struct mac_info* obj = NULL;
+
+    atomic_inc(&reader_waiting);
+    read_lock(&rhash_rwlock);
+    
+    rhashtable_walk_enter(&frames_info, &iter);
+    rhashtable_walk_start(&iter);
+
+    while ((obj = (struct mac_info*)rhashtable_walk_next(&iter)) != NULL) {
+        if (IS_ERR(obj))
+            continue;
+
+        struct mac_info *new_obj = kmalloc(sizeof(struct mac_info), GFP_ATOMIC);
+        if (!new_obj) {
+            printk(KERN_ERR "Failed to allocate memory for snapshot\n");
+            break;
+        }
+
+        memcpy(new_obj, obj, sizeof(struct mac_info));
+        rhashtable_insert_fast(&rhash_frames_copy, &new_obj->linkage, object_params);
+    }
+
+    rhashtable_walk_stop(&iter);
+    rhashtable_walk_exit(&iter);
+
+    bool res = schedule_work(&rhash_worker);
+
+    read_unlock(&rhash_rwlock);
+    atomic_dec(&reader_waiting);
+    wake_up_all(&writers_wq);
+}
+
 static int wq_process_batch(struct work_struct *work) {
     struct work_info *w_info = container_of(work, struct work_info, work);
     int cpu_id = w_info->cpu_id, res = 0;
 
     struct ring_buffer *rb = &per_cpu(percpu_circ_buf, cpu_id);
     struct kfifo *w_stack = &per_cpu(worker_stack, cpu);
+    spinlock_t *s_lock = &per_cpu(kfifo_slock, cpu);
     atomic_t *b_counter = &per_cpu(batch_counter, cpu);
     int counter = atomic_read(b_counter);
     uint32_t start_index = (rb->tail + 1) % BUF_SIZE;
 
     for(uint16_t i = start_index; i < BATCH_SIZE + start_index; i++) {
         struct packet_info *p_info = &((struct packet_info *)rb->buffer)[i % BUF_SIZE];
+        const void *key = p_info->eth_h.h_source;
+        struct mac_info *found = (struct mac_info *)rhashtable_lookup_fast(&frames_info, key, object_params);
+
+        if (found) {
+            int res = enqueue_circ_buf(rb, p_info);//batch tail needed
+            if (res < 0) {
+                printk(KERN_WARNING "ring buffer overflow on CPU %d\n", cpu_id);
+            }     
+            continue;
+        }
+
         struct mac_info *mi = kmalloc(sizeof(struct mac_info), GFP_ATOMIC);
         if(!mi) {
             printk(KERN_ERR "Failed to allocate memory in batch processor\n");
@@ -139,16 +191,23 @@ static int wq_process_batch(struct work_struct *work) {
         mi->counter = 1;
         memcpy(mi->src_mac, p_info->eth_h.h_source, ETH_ALEN);
 
-        struct mac_info * old_obj = (struct mac_info *)rhashtable_lookup_get_insert_fast(&frames_info, &mi->linkage, object_params);
+        while (atomic_read(&reader_waiting) > 0) {//dumping taking place
+            wait_event(writers_wq, atomic_read(&reader_pending) == 0);
+        }
+
+        write_lock(&rhash_rwlock);
+        struct mac_info * old_obj = (struct mac_info *)rhashtable_lookup_get_insert_fast(&rhash_frames, &mi->linkage, object_params);
+        write_unlock(&rhash_rwlock);
+        
         if(IS_ERR(old_obj)) {
             kfree(mi); 
             printk(KERN_ERR "Failed to insert object into hash table in batch processor\n");
             res = PTR_ERR(old_obj);
         }
-        else if(old_obj) {//exists
-            kfree(mi); 
-            old_obj->counter++;
-        }
+        // else if(old_obj) {//exists
+        //     kfree(mi); 
+        //     old_obj->counter++;
+        // }
         //else inserted and NULL returned
         int res = enqueue_circ_buf(rb, p_info);//rb->tail at the end will be equal (start_index + BATCH_SIZE - 2) t
         //return memory back for new write (so dequeue uses it)
@@ -156,10 +215,12 @@ static int wq_process_batch(struct work_struct *work) {
             printk(KERN_WARNING "ring buffer overflow on CPU %d\n", cpu_id);
         }      
     }
+    spin_lock(s_lock);
     if (!kfifo_in(w_stack, work, sizeof(struct work_info *))) {//returning work back to stack kfifo
         printk(KERN_ERR "Failed to return worker to stack for CPU %d\n", cpu);
         return -ENOMEM;
     }
+    spin_unlock(s_lock);
 
     return res;
 }
@@ -188,6 +249,9 @@ static int init_per_cpu(void) {
             printk(KERN_ERR "Failed to allocate kfifo for CPU %d\n", cpu);
             return -1;
         }
+
+        spinlock_t *s_lock = &per_cpu(kfifo_slock, cpu);
+        spin_lock_init(s_lock);
 
         struct work_info *local_workers = per_cpu(wq_workers, cpu);
         for (int i = 0; i < WORKERS_SIZE; i++) {
@@ -234,8 +298,9 @@ static unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const s
 
     int cpu = smp_processor_id();
     struct workqueue_struct *wq_ptr = per_cpu(percpu_workqueue, cpu);
-    struct work_info *local_workers = per_cpu(wq_workers, cpu);
+    // struct work_info *local_workers = per_cpu(wq_workers, cpu);
     struct kfifo *w_stack = &per_cpu(worker_stack, cpu);
+    spinlock_t *s_lock = &per_cpu(kfifo_slock, cpu);
     atomic_t *b_counter = &per_cpu(batch_counter, cpu);
     struct ring_buffer *rb = &per_cpu(percpu_circ_buf, cpu);
 
@@ -245,7 +310,7 @@ static unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const s
         return NF_ACCEPT;
     }
     memcpy(&p_info->eth_h, eth_h, sizeof(struct ethhdr));
-    memcpy(&p_info->ip_h, ip_h, sizeof(struct iphdr));
+    //memcpy(&p_info->ip_h, ip_h, sizeof(struct iphdr));
 
     atomic_inc(b_counter);
     counter = atomic_read(b_counter);
@@ -253,8 +318,10 @@ static unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const s
         struct work_info *worker = NULL;
 
         if (!kfifo_is_empty(w_stack)) {
+            spin_lock(s_lock);
             kfifo_out(w_stack, &worker, sizeof(struct work_info *));
-            queue_work(wq_ptr, &worker->work);
+            spin_unlock(s_lock);
+            bool res = queue_work(wq_ptr, &worker->work);
         } else {
             printk(KERN_WARNING "No free workers available\n");
             //
@@ -288,8 +355,12 @@ static int __init logger_init(void) {
         destroy_packet_cache();
         return -EINVAL;
     }
-    if(!rhashtable_init(&frames_info, &object_params)) {
+    if(!rhashtable_init(&rhash_frames, &object_params)) {
         printk(KERN_ERR "Error initing hashtable in logger_init\n");
+        return -EINVAL;
+    }
+    if(!rhashtable_init(&rhash_frames_copy, &object_params)) {
+        printk(KERN_ERR "Error initing hashtable #2 in logger_init\n");
         return -EINVAL;
     }
     init_hook(&nf_netdev_hook, traffic_netdev_hook, NFPROTO_NETDEV, NF_NETDEV_INGRESS, NF_IP_PRI_FIRST);
