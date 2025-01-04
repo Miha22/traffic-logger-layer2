@@ -24,12 +24,13 @@ static struct rhashtable rhash_frames;
 static struct mac_list *mac_list;//mac strings to dump
 DECLARE_WORK(rhash_worker, wq_process_dump);
 static struct kmem_cache *packet_cache;
-static struct nf_hook_ops nf_netdev_hook;
+static struct nf_hook_ops nfho;
 static DEFINE_RWLOCK(rhash_rwlock);
 static DECLARE_WAIT_QUEUE_HEAD(writers_wq);
 static atomic_t reader_waiting = ATOMIC_INIT(0);//prioritized reader for periodic dumping
 static DEFINE_PER_CPU(struct ring_buffer, percpu_circ_buf);
 static DEFINE_PER_CPU(atomic_t, batch_counter);
+static DEFINE_PER_CPU(atomic_t, buffer_offset);
 static DECLARE_PER_CPU(struct workqueue_struct *, percpu_workqueue);
 static DECLARE_PER_CPU(struct work_info[WORKERS_SIZE], wq_workers);
 static DEFINE_PER_CPU(struct kfifo, worker_stack);
@@ -120,7 +121,12 @@ static void* dequeue_circ_buf(struct ring_buffer *rb) {
 }
 
 static int wq_process_dump(struct work_struct *work) { 
-    //dump into proc filesystem
+    char mac_str[MAC_SIZE];
+    //mutex lock
+    for(uint32_t = i; i < mac_list->len; i++) {
+        snprintf(mac_str, MAC_SIZE, "%pM", mac_list->arr[i]);
+        //assemble and dump or dump in stream
+    }
 
     return 0;
 }
@@ -132,17 +138,24 @@ void dump_htable(void) {
     atomic_inc(&reader_waiting);
     read_lock(&rhash_rwlock);
     
-    rhashtable_walk_enter(&frames_info, &iter);
+    rhashtable_walk_enter(&rhash_frames, &iter);
     rhashtable_walk_start(&iter);
     uint32_t i = 0;
     while (i < BUF_SIZE && (obj = (struct mac_info*)rhashtable_walk_next(&iter)) != NULL) {
-        if (IS_ERR(obj))
+        if (IS_ERR(obj)) {
+            printk(KERN_ERR "Error encountered while iterating hash table\n");
             continue;
-        
-        //memcpy(mac_arr_d[i], obj->src_mac, ETH_ALEN);
-        snprintf(mac_arr_d[i], MAC_SIZE, "%pM", obj->src_mac);
+        }
+            
+        memcpy(mac_list->arr[i], obj->src_mac, ETH_ALEN);
         i++;
+        if(rhashtable_remove_fast(rhash_frames, &obj->linkage, object_params) == 0)
+            kfree(obj);
+        else {
+            printk(KERN_WARNING "Cannot remove object from rhashtable");
+        }
     }
+    mac_list->len = i;
 
     rhashtable_walk_stop(&iter);
     rhashtable_walk_exit(&iter);
@@ -154,7 +167,7 @@ void dump_htable(void) {
     wake_up_all(&writers_wq);
 }
 
-static int wq_process_batch(struct work_struct *work) {
+static int wq_process_batch(struct work_struct *work) {//deferred
     struct work_info *w_info = container_of(work, struct work_info, work);
     int cpu_id = w_info->cpu_id, res = 0;
 
@@ -162,13 +175,12 @@ static int wq_process_batch(struct work_struct *work) {
     struct kfifo *w_stack = &per_cpu(worker_stack, cpu);
     spinlock_t *s_lock = &per_cpu(kfifo_slock, cpu);
     atomic_t *b_counter = &per_cpu(batch_counter, cpu);
-    int counter = atomic_read(b_counter);
-    uint32_t start_index = (rb->tail + 1) % BUF_SIZE;
+    uint32_t start_index = w_info->batch_tail;
 
     for(uint16_t i = start_index; i < BATCH_SIZE + start_index; i++) {
-        struct packet_info *p_info = &((struct packet_info *)rb->buffer)[i % BUF_SIZE];
+        struct packet_info *p_info = (struct packet_info *)rb->buffer[i];
         const void *key = p_info->eth_h.h_source;
-        struct mac_info *found = (struct mac_info *)rhashtable_lookup_fast(&frames_info, key, object_params);
+        struct mac_info *found = (struct mac_info *)rhashtable_lookup_fast(&rhash_frames, key, object_params);
 
         if (found) {
             int res = enqueue_circ_buf(rb, p_info);//batch tail needed
@@ -183,7 +195,6 @@ static int wq_process_batch(struct work_struct *work) {
             printk(KERN_ERR "Failed to allocate memory in batch processor\n");
             return -ENOMEM;
         }
-        mi->counter = 1;
         memcpy(mi->src_mac, p_info->eth_h.h_source, ETH_ALEN);
 
         while (atomic_read(&reader_waiting) > 0) {//dumping taking place
@@ -263,6 +274,9 @@ static int init_per_cpu(void) {
         atomic_t *b_counter = &per_cpu(batch_counter, cpu);
         atomic_set(b_counter, 0);
 
+        atomic_t *b_offset = &per_cpu(buffer_offset, cpu);
+        atomic_set(b_offset, 0);
+
         struct ring_buffer *rb = &per_cpu(percpu_circ_buf, cpu);
         for(uint16_t i = 0; i < BUF_SIZE; i++) {
             struct packet_info *p_info = allocate_packet_cache();
@@ -310,20 +324,28 @@ static unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const s
     atomic_inc(b_counter);
     counter = atomic_read(b_counter);
     if(counter % BATCH_SIZE == 0) {
+        if(counter == BUF_SIZE)
+            atomic_set(b_counter, 0);
+            
         struct work_info *worker = NULL;
-
         if (!kfifo_is_empty(w_stack)) {
             spin_lock(s_lock);
-            kfifo_out(w_stack, &worker, sizeof(struct work_info *));
+            kfifo_out(w_stack, &worker, sizeof(struct work_info *));//get not pop next to replace batch offset
             spin_unlock(s_lock);
+            if (!worker) {
+                printk(KERN_WARNING "Failed to retrieve a worker\n");
+                return NF_ACCEPT;
+            }
+            worker->batch_tail = counter - BATCH_SIZE;
             bool res = queue_work(wq_ptr, &worker->work);
+            if (!res) {
+                printk(KERN_WARNING "Failed to queue work\n");
+            }
         } else {
-            printk(KERN_WARNING "No free workers available\n");
-            //
+            printk(KERN_WARNING "No free workers available. Consider increasing ring buffer size and batch size\n");
+            //bandwidth reached
             return NF_ACCEPT;
         }
-
-        queue_work(wq_ptr, &worker.work);
     }
 
     return NF_ACCEPT;
@@ -335,15 +357,15 @@ static void init_hook(struct nf_hook_ops *nfho,
                     uint32_t routing, 
                     int32_t priority
                 ) {
-    nfho->hook = hook_cb;
+    nfho->hook = (nf_hookfn*)hook_cb;
     nfho->dev = NULL;
     nfho->pf = protocol;
     nfho->hooknum = routing;
     nfho->priority = priority;
 }
 
-
 static int __init logger_init(void) {
+    nfho = (struct nf_hook_ops*)kcalloc(1, sizeof(struct nf_hook_ops), GFP_KERNEL);
     mac_list = (struct mac_list *)kmalloc(sizeof(struct mac_list), GFP_KERNEL);
     if(!mac_list) {
         printk(KERN_ERR "Failed to allocate memory for mac list[%d]\n", i);
@@ -352,7 +374,7 @@ static int __init logger_init(void) {
     for (int i = 0; i < BUF_SIZE; i++) {
         mac_list->arr[i] = kmalloc(ETH_ALEN, GFP_KERNEL);
         if (mac_list->arr[i] == NULL) {
-            printk(KERN_ERR "Failed to allocate memory for mac_arr_d[%d]\n", i);
+            printk(KERN_ERR "Failed to allocate memory for mac_list->arr[%d]\n", i);
             for (int j = 0; j < i; j++) {
                 kfree(mac_list->arr[j]);
             }
@@ -372,20 +394,28 @@ static int __init logger_init(void) {
         printk(KERN_ERR "Error initing hashtable in logger_init\n");
         return -EINVAL;
     }
-    if(!rhashtable_init(&rhash_frames_copy, &object_params)) {
-        printk(KERN_ERR "Error initing hashtable #2 in logger_init\n");
-        return -EINVAL;
-    }
-    init_hook(&nf_netdev_hook, traffic_netdev_hook, NFPROTO_NETDEV, NF_NETDEV_INGRESS, NF_IP_PRI_FIRST);
-
+    init_hook(nfho, traffic_netdev_hook, NFPROTO_NETDEV, NF_NETDEV_INGRESS, NF_IP_PRI_FIRST);
+    nf_register_net_hook(&init_net, nfho);
     printk(KERN_INFO "Traffic logger module loaded.\n");
 
     return 0;
 }
 
 static void __exit logger_exit(void) {
+    nf_unregister_net_hook(&init_net, nfho);
+	kfree(nfho);
+    flush_scheduled_work(&rhash_worker);
     int cpu;
     for_each_possible_cpu(cpu) {
+        struct workqueue_struct *wq_ptr = per_cpu(percpu_workqueue, cpu);
+        struct kfifo *w_stack = &per_cpu(worker_stack, cpu);
+        struct work_info *local_workers = per_cpu(wq_workers, cpu);
+
+        for(uint16_t i = 0; i < WORKERS_SIZE; i++) {
+            cancel_work_sync(&local_workers[i].work);
+        }
+        kfifo_free(w_stack);
+
         struct ring_buffer *rb = &per_cpu(percpu_circ_buf, cpu);
         struct packet_info *data = NULL;
         while ((data = dequeue_circ_buf(rb)) != NULL) {
@@ -394,6 +424,31 @@ static void __exit logger_exit(void) {
         destroy_workqueue(per_cpu(percpu_workqueue, cpu));
     }
     destroy_packet_cache();
+
+    struct rhashtable_iter iter;
+    struct mac_info* obj = NULL;
+    atomic_inc(&reader_waiting);
+    read_lock(&rhash_rwlock);
+    rhashtable_walk_enter(&rhash_frames, &iter);
+    rhashtable_walk_start(&iter);
+
+    while ((obj = (struct mac_info*)rhashtable_walk_next(&iter)) != NULL) {
+        if (IS_ERR(obj)) {
+            printk(KERN_ERR "Error encountered while iterating hash table in log exit\n");
+            continue;
+        }
+        if(rhashtable_remove_fast(rhash_frames, &obj->linkage, object_params) == 0)
+            kfree(obj);
+        else {
+            printk(KERN_WARNING "Cannot remove object from rhashtable");
+        }
+    }
+
+    rhashtable_walk_stop(&iter);
+    rhashtable_walk_exit(&iter);
+
+    read_unlock(&rhash_rwlock);
+    atomic_dec(&reader_waiting);
 
     for (int i = 0; i < BUF_SIZE; i++) {
         kfree(mac_list->arr[i]);
