@@ -1,3 +1,6 @@
+#define CONFIG_NETFILTER
+#ifdef CONFIG_NETFILTER
+
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -9,6 +12,7 @@
 
 #include <linux/slab.h>
 #include <linux/workqueue.h>  
+#include <linux/kfifo.h>
 #include <linux/percpu.h>
 
 #include <linux/spinlock.h>
@@ -23,14 +27,14 @@
 static struct rhashtable rhash_frames;
 static struct mac_list *mac_list;//mac strings to dump
 DECLARE_WORK(rhash_worker, wq_process_dump);
-static struct kmem_cache *packet_cache;
+static DEFINE_PER_CPU(struct kmem_cache *, packet_cache);
 static struct nf_hook_ops nfho;
 static DEFINE_RWLOCK(rhash_rwlock);
 static DECLARE_WAIT_QUEUE_HEAD(writers_wq);
 static atomic_t reader_waiting = ATOMIC_INIT(0);//prioritized reader for periodic dumping
 static DEFINE_PER_CPU(struct ring_buffer, percpu_circ_buf);
 static DEFINE_PER_CPU(atomic_t, batch_counter);
-static DEFINE_PER_CPU(atomic_t, buffer_offset);
+//static DEFINE_PER_CPU(atomic_t, buffer_offset);
 static DECLARE_PER_CPU(struct workqueue_struct *, percpu_workqueue);
 static DECLARE_PER_CPU(struct work_info[WORKERS_SIZE], wq_workers);
 static DEFINE_PER_CPU(struct kfifo, worker_stack);
@@ -67,20 +71,20 @@ const static struct rhashtable_params object_params = {
     .obj_cmpfn   = mac_obj_cmpfn,
 };
 
-static struct packet_info *allocate_packet_cache(void) {
-    return kmem_cache_alloc(packet_cache, GFP_ATOMIC);
+static struct packet_info *allocate_packet_cache(struct kmem_cache *cachep) {
+    return kmem_cache_alloc(cachep, GFP_ATOMIC);
 }
 
-static void free_packet_cache(struct packet_info *pkt) {
-    kmem_cache_free(packet_cache, pkt);
+static void free_packet_cache(struct kmem_cache *cachep, struct packet_info *pkt) {
+    kmem_cache_free(cachep, pkt);
 }
 
-static void destroy_packet_cache(void) {
-    kmem_cache_destroy(packet_cache);
+static void destroy_packet_cache(struct kmem_cache *cachep) {
+    kmem_cache_destroy(cachep);
 }
 
-static int init_packet_cache(void) {
-    packet_cache = kmem_cache_create(
+static int init_packet_cache(struct kmem_cache **cache) {
+    *cache = kmem_cache_create(
 		"packet_cache",
 		sizeof(struct packet_info), 
 		0, 
@@ -88,7 +92,7 @@ static int init_packet_cache(void) {
 		NULL
 	);
 
-    if (!packet_cache) {
+    if (!*cache) {
         printk(KERN_ERR "Failed to create slab cache for struct packet_info\n");
         return -ENOMEM;
     }
@@ -98,10 +102,10 @@ static int init_packet_cache(void) {
 
 static int enqueue_circ_buf(struct ring_buffer *rb, void *data) {
     uint32_t next_tail = (rb->tail + 1 % BUF_SIZE);
-    if(next_tail == rb->head) {
-        printk(KERN_WARNING "[tail]ring buffer is full, cannot enqueue data\n");
-        return -1;
-    }
+    // if(next_tail == rb->head) {
+    //     printk(KERN_WARNING "[tail]ring buffer is full, cannot enqueue data\n");
+    //     return -1;
+    // }
     rb->buffer[rb->tail] = data;
     rb->tail = next_tail;
 
@@ -109,10 +113,10 @@ static int enqueue_circ_buf(struct ring_buffer *rb, void *data) {
 }
 
 static void* dequeue_circ_buf(struct ring_buffer *rb) {
-    if(rb->head == rb->tail) {
-        printk(KERN_WARNING "[head]ring buffer is empty, cannot dequeue data\n");
-        return NULL;
-    }
+    // if(rb->head == rb->tail) {
+    //     printk(KERN_WARNING "[head]ring buffer is empty, cannot dequeue data\n");
+    //     return NULL;
+    // }
     void* data = rb->buffer[rb->head];
     uint32_t next_head = (rb->head + 1 % BUF_SIZE);
     rb->head = next_head;
@@ -167,17 +171,17 @@ void dump_htable(void) {
     wake_up_all(&writers_wq);
 }
 
-static int wq_process_batch(struct work_struct *work) {//deferred
-    struct work_info *w_info = container_of(work, struct work_info, work);
-    int cpu_id = w_info->cpu_id, res = 0;
+static int wq_process_batch(struct work_struct *work_ptr) {//deferred
+    struct work_info *w_info = container_of(work_ptr, struct work_info, work);
+    //int cpu = w_info->cpu_id, res = 0;
 
-    struct ring_buffer *rb = &per_cpu(percpu_circ_buf, cpu_id);
-    struct kfifo *w_stack = &per_cpu(worker_stack, cpu);
-    spinlock_t *s_lock = &per_cpu(kfifo_slock, cpu);
-    atomic_t *b_counter = &per_cpu(batch_counter, cpu);
-    uint32_t start_index = w_info->batch_tail;
+    struct ring_buffer *rb = &this_cpu_ptr(percpu_circ_buf);
+    struct kfifo *w_stack = &this_cpu_ptr(worker_stack);
+    spinlock_t *s_lock = &this_cpu_ptr(kfifo_slock);
+    atomic_t *b_counter = &this_cpu_ptr(batch_counter);
+    int start_index = w_info->batch_start;
 
-    for(uint16_t i = start_index; i < BATCH_SIZE + start_index; i++) {
+    for(int i = start_index; i < BATCH_SIZE + start_index; i++) {
         struct packet_info *p_info = (struct packet_info *)rb->buffer[i];
         const void *key = p_info->eth_h.h_source;
         struct mac_info *found = (struct mac_info *)rhashtable_lookup_fast(&rhash_frames, key, object_params);
@@ -222,7 +226,7 @@ static int wq_process_batch(struct work_struct *work) {//deferred
         }      
     }
     spin_lock(s_lock);
-    if (!kfifo_in(w_stack, work, sizeof(struct work_info *))) {//returning work back to stack kfifo
+    if (!kfifo_put(w_stack, w_info)) {
         printk(KERN_ERR "Failed to return worker to stack for CPU %d\n", cpu);
         return -ENOMEM;
     }
@@ -232,12 +236,28 @@ static int wq_process_batch(struct work_struct *work) {//deferred
 }
 
 static int init_per_cpu(void) {
-    if(packet_cache == NULL) {
-        printk(KERN_ERR "Cache must be initialized first\n");
-        return -EPERM;
-    }
     int cpu, res;
     for_each_possible_cpu(cpu) {
+        struct kmem_cache **cache = &per_cpu(packet_cache, cpu);
+        int res = init_packet_cache(cache);
+
+        if(res < 0) {
+            return -ENVAL;
+        }
+
+        struct ring_buffer *rb = &per_cpu(percpu_circ_buf, cpu);
+        for(uint16_t i = 0; i < BUF_SIZE; i++) {
+            struct packet_info *p_info = allocate_packet_cache(*cache);
+            res = enqueue_circ_buf(rb, p_info);
+            if(res < 0) {
+                printk(KERN_ERR "Cannot allocate cache for packet during init due to ring buffer error\n");
+                return -1;
+            }
+        }
+
+        atomic_t *b_counter = &per_cpu(batch_counter, cpu);
+        atomic_set(b_counter, 0);
+
         char wq_name[32];
         snprintf(wq_name, sizeof(wq_name), "percpu_wq_%d", cpu);
         struct workqueue_struct *wq = alloc_workqueue(wq_name, WQ_UNBOUND, 0);
@@ -262,28 +282,12 @@ static int init_per_cpu(void) {
         struct work_info *local_workers = per_cpu(wq_workers, cpu);
         for (int i = 0; i < WORKERS_SIZE; i++) {
             local_workers[i].cpu_id = cpu;
+            local_workers[i].batch_start = i * BATCH_SIZE;
+            //local_workers[i].batch_end = local_workers[i].batch_start + BATCH_SIZE;
             INIT_WORK(&local_workers[i].work, wq_process_batch);
-
-            if (!kfifo_in(w_stack, &local_workers[i], sizeof(struct work_info *))) {
-                printk(KERN_ERR "Failed to initialize worker stack for CPU %d\n", cpu);
-                kfifo_free(w_stack);
+            if (!kfifo_put(w_stack, &local_workers[i])) {
+                printk(KERN_WARNING "KFIFO full, failed to enqueue worker\n");
                 return -ENOMEM;
-            }
-        }
-
-        atomic_t *b_counter = &per_cpu(batch_counter, cpu);
-        atomic_set(b_counter, 0);
-
-        atomic_t *b_offset = &per_cpu(buffer_offset, cpu);
-        atomic_set(b_offset, 0);
-
-        struct ring_buffer *rb = &per_cpu(percpu_circ_buf, cpu);
-        for(uint16_t i = 0; i < BUF_SIZE; i++) {
-            struct packet_info *p_info = allocate_packet_cache();
-            res = enqueue_circ_buf(rb, p_info);
-            if(res < 0) {
-                printk(KERN_ERR "Cannot allocate cache for packet during init due to ring buffer error\n");
-                return -1;
             }
         }
     }
@@ -305,19 +309,20 @@ static unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const s
         return NF_ACCEPT;
     }
 
-    int cpu = smp_processor_id();
-    struct workqueue_struct *wq_ptr = per_cpu(percpu_workqueue, cpu);
+    //int cpu = smp_processor_id();
+    struct workqueue_struct *wq_ptr = this_cpu_ptr(percpu_workqueue);
     // struct work_info *local_workers = per_cpu(wq_workers, cpu);
-    struct kfifo *w_stack = &per_cpu(worker_stack, cpu);
-    spinlock_t *s_lock = &per_cpu(kfifo_slock, cpu);
-    atomic_t *b_counter = &per_cpu(batch_counter, cpu);
-    struct ring_buffer *rb = &per_cpu(percpu_circ_buf, cpu);
+    struct kfifo *w_stack = &this_cpu_ptr(worker_stack);
+    spinlock_t *s_lock = &this_cpu_ptr(kfifo_slock);
+    atomic_t *b_counter = &this_cpu_ptr(batch_counter);
+    //atomic_t *b_offset = &this_cpu_ptr(buffer_offset);
+    struct ring_buffer *rb = &this_cpu_ptr(percpu_circ_buf);
 
     struct packet_info *p_info = (struct packet_info *)dequeue_circ_buf(rb);//taking allocated memory and moving head
-    if(!p_info) {
-        printk(KERN_WARNING "[BUF_FULL] failed to store incoming packet, skipping\n");
-        return NF_ACCEPT;
-    }
+    // if(!p_info) {
+    //     printk(KERN_WARNING "[BUF_FULL] failed to store incoming packet, skipping\n");
+    //     return NF_ACCEPT;
+    // }
     memcpy(&p_info->eth_h, eth_h, sizeof(struct ethhdr));
     //memcpy(&p_info->ip_h, ip_h, sizeof(struct iphdr));
 
@@ -328,18 +333,26 @@ static unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const s
             atomic_set(b_counter, 0);
             
         struct work_info *worker = NULL;
+        struct work_info worker_next = NULL;
         if (!kfifo_is_empty(w_stack)) {
             spin_lock(s_lock);
-            kfifo_out(w_stack, &worker, sizeof(struct work_info *));//get not pop next to replace batch offset
-            spin_unlock(s_lock);
-            if (!worker) {
-                printk(KERN_WARNING "Failed to retrieve a worker\n");
-                return NF_ACCEPT;
+            if (!kfifo_get(w_stack, worker)) {
+                //printk(KERN_WARNING "KFIFO empty, failed to dequeue worker\n");
+            
             }
-            worker->batch_tail = counter - BATCH_SIZE;
+            if(!kfifo_peek(w_stack, worker_next)) {
+                //printk(KERN_WARNING "KFIFO getting empty, will be no more free space in ring buffer\n");
+                
+            }
+            else {
+                //atomic_set(b_offset, worker_next->batch_start);
+                rb->head = worker_next->batch_start;
+            }
+            spin_unlock(s_lock);
+
             bool res = queue_work(wq_ptr, &worker->work);
             if (!res) {
-                printk(KERN_WARNING "Failed to queue work\n");
+                printk(KERN_WARNING "Failed to queue work in workqueue\n");
             }
         } else {
             printk(KERN_WARNING "No free workers available. Consider increasing ring buffer size and batch size\n");
@@ -364,10 +377,54 @@ static void init_hook(struct nf_hook_ops *nfho,
     nfho->priority = priority;
 }
 
+static void clear_slab_caches(void) {
+    int cpu;
+    for_each_possible_cpu(cpu) { 
+        struct kmem_cache **cache = &per_cpu(packet_cache, cpu);
+        struct ring_buffer *rb = &per_cpu(percpu_circ_buf, cpu);
+        struct packet_info *data = NULL;
+        for(int i = 0; i < BUF_SIZE; i++) {
+            data = (struct packet_info *)rb->buffer[i];
+            free_packet_cache(*cache, data);
+        }
+        destroy_packet_cache(*cache);
+    }
+}
+
+static void clear_workqueues(void) {
+    //flush_scheduled_work();
+    cancel_work_sync(&rhash_worker);
+    int cpu;
+    for_each_possible_cpu(cpu) { 
+        struct work_info *local_workers = per_cpu(wq_workers, cpu);
+        for(uint16_t i = 0; i < WORKERS_SIZE; i++) {
+            cancel_work_sync(&local_workers[i].work);
+        }
+        
+        destroy_workqueue(per_cpu(percpu_workqueue, cpu));
+    }
+}
+
+static void free_kfifos(void) {
+    int cpu;
+    for_each_possible_cpu(cpu) {
+        struct kfifo *w_stack = &per_cpu(worker_stack, cpu);
+        if(!kfifo_is_empty(w_stack)) {
+
+        }
+        kfifo_free(w_stack);
+    }
+}
+
 static int __init logger_init(void) {
     nfho = (struct nf_hook_ops*)kcalloc(1, sizeof(struct nf_hook_ops), GFP_KERNEL);
+    if(!nfho) {
+        printk(KERN_ERR "Failed to allocate memory for mac list[%d]\n", i);
+        return -ENOMEM; 
+    }
     mac_list = (struct mac_list *)kmalloc(sizeof(struct mac_list), GFP_KERNEL);
     if(!mac_list) {
+        kfree(nfho);
         printk(KERN_ERR "Failed to allocate memory for mac list[%d]\n", i);
         return -ENOMEM; 
     }
@@ -379,23 +436,48 @@ static int __init logger_init(void) {
                 kfree(mac_list->arr[j]);
             }
             kfree(mac_list);
+            kfree(nfho);
             return -ENOMEM; 
         }
     }
-
-    if (init_packet_cache() < 0) {
-        return -EINVAL;
-    }
     if (init_per_cpu() < 0) {
-        destroy_packet_cache();
+        free_kfifos();
+        clear_workqueues();
+        clear_slab_caches();
+        for (int j = 0; j < BUF_SIZE; j++) {
+            kfree(mac_list->arr[j]);
+        }
+        kfree(mac_list);
+        kfree(nfho);
         return -EINVAL;
     }
     if(!rhashtable_init(&rhash_frames, &object_params)) {
+        free_kfifos();
+        clear_workqueues();
+        clear_slab_caches();
+        for (int j = 0; j < BUF_SIZE; j++) {
+            kfree(mac_list->arr[j]);
+        }
+        kfree(mac_list);
+        kfree(nfho);
         printk(KERN_ERR "Error initing hashtable in logger_init\n");
         return -EINVAL;
     }
     init_hook(nfho, traffic_netdev_hook, NFPROTO_NETDEV, NF_NETDEV_INGRESS, NF_IP_PRI_FIRST);
-    nf_register_net_hook(&init_net, nfho);
+    int ret = nf_register_net_hook(&init_net, nfho); 
+    if (ret < 0) {
+        free_kfifos();
+        clear_workqueues();
+        clear_slab_caches();
+        for (int j = 0; j < BUF_SIZE; j++) {
+            kfree(mac_list->arr[j]);
+        }
+        kfree(mac_list);
+        kfree(nfho);
+        printk(KERN_ERR "Failed to register hook: %d\n", ret);
+        return ret;
+    }
+
     printk(KERN_INFO "Traffic logger module loaded.\n");
 
     return 0;
@@ -403,27 +485,9 @@ static int __init logger_init(void) {
 
 static void __exit logger_exit(void) {
     nf_unregister_net_hook(&init_net, nfho);
-	kfree(nfho);
-    flush_scheduled_work(&rhash_worker);
-    int cpu;
-    for_each_possible_cpu(cpu) {
-        struct workqueue_struct *wq_ptr = per_cpu(percpu_workqueue, cpu);
-        struct kfifo *w_stack = &per_cpu(worker_stack, cpu);
-        struct work_info *local_workers = per_cpu(wq_workers, cpu);
-
-        for(uint16_t i = 0; i < WORKERS_SIZE; i++) {
-            cancel_work_sync(&local_workers[i].work);
-        }
-        kfifo_free(w_stack);
-
-        struct ring_buffer *rb = &per_cpu(percpu_circ_buf, cpu);
-        struct packet_info *data = NULL;
-        while ((data = dequeue_circ_buf(rb)) != NULL) {
-            free_packet_cache(data);
-        }
-        destroy_workqueue(per_cpu(percpu_workqueue, cpu));
-    }
-    destroy_packet_cache();
+    free_kfifos();
+    clear_workqueues();
+    clear_slab_caches();
 
     struct rhashtable_iter iter;
     struct mac_info* obj = NULL;
@@ -454,6 +518,7 @@ static void __exit logger_exit(void) {
         kfree(mac_list->arr[i]);
     }
     kfree(mac_list);
+    kfree(nfho);
     printk(KERN_INFO "Traffic logger module Unloaded.\n");
 }
 
@@ -463,3 +528,5 @@ module_exit(logger_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Den/M22");
 MODULE_DESCRIPTION("Packet logger");
+
+#endif
