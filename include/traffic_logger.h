@@ -1,9 +1,8 @@
 #pragma once
 
-#include <linux/rhashtable.h>
-#include <linux/etherdevice.h>
-#include <linux/ip.h> 
+#include <linux/types.h>
 
+#define WHITELIST_SIZE 65536
 #define BUF_SIZE 1000
 #define WORKERS_SIZE BUF_SIZE / BATCH_SIZE
 #define MAC_SIZE 18 // 11 22 33 44 55 66 = 12 + 5 + 1 = 18 chars
@@ -14,18 +13,18 @@ struct mac_info {
 	struct rhash_head linkage;
 	// uint32_t counter;
 	refcount_t ref;
-	struct rcu_head rcu_read;
+	struct rcu_head r_head;
 };
 
 struct mac_list {
 	unsigned char *arr[BUF_SIZE];
 	uint32_t len;
-}
+};
 
 struct packet_info {
 	struct ethhdr eth_h;
 	//struct iphdr ip_h;
-}
+};
 
 struct work_info {
     struct work_struct work;
@@ -35,3 +34,4 @@ struct work_info {
 
 static int wq_process_dump(struct work_struct *work_ptr);
 static void clear_slab_caches(void);
+void dump_htable(struct work_struct work*);
