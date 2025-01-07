@@ -26,18 +26,18 @@
 #include <traffic_logger.h>
 
 static struct rhashtable rhash_frames;
-static struct nf_hook_ops nfho;
+static struct nf_hook_ops *nfho;
 static struct mac_list *mac_list;//mac strings to dump
 
 DEFINE_PER_CPU(struct kmem_cache *, packet_cache);
+//struct kmem_cache __percpu *packet_cache;
 static DEFINE_RWLOCK(rhash_rwlock);
-//static DECLARE_WAIT_QUEUE_HEAD(writers_wq);
-//static atomic_t reader_waiting = ATOMIC_INIT(0);//prioritized reader for periodic dumping
 DEFINE_PER_CPU(struct ring_buffer, percpu_circ_buf);//it eventually became a segmented array
 DEFINE_PER_CPU(atomic_t, batch_counter);
 DEFINE_PER_CPU(atomic_t, skip_counter);
-DECLARE_PER_CPU(struct workqueue_struct *, percpu_workqueue);
-DECLARE_PER_CPU(struct work_info[WORKERS_SIZE], wq_workers);
+DEFINE_PER_CPU(struct workqueue_struct *, percpu_workqueue);
+//struct workqueue_struct __percpu *percpu_workqueue;
+DEFINE_PER_CPU(struct work_info[WORKERS_SIZE], wq_workers);
 DEFINE_PER_CPU(struct kfifo, worker_stack);
 DEFINE_PER_CPU(spinlock_t, kfifo_slock);
 
@@ -48,7 +48,7 @@ static char *dump_buffer;
 static size_t buffer_len;
 static DEFINE_MUTEX(buffer_lock);
 
-static ssize_t proc_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
+static ssize_t proc_read_cb(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
     mutex_lock(&buffer_lock);
     ssize_t ret = simple_read_from_buffer(buf, count, ppos, dump_buffer, buffer_len);
@@ -57,9 +57,8 @@ static ssize_t proc_read(struct file *file, char __user *buf, size_t count, loff
     return ret;
 }
 
-static const struct file_operations proc_fops = {
-    .owner = THIS_MODULE,
-    .read = proc_read,
+static const struct proc_ops proc_fops = {
+    .proc_read = proc_read_cb,
 };
 
 static u32 mac_hashfn(const void *data, u32 len, u32 seed)
@@ -114,12 +113,10 @@ void dump_htable(struct work_struct *work) {
     synchronize_rcu();
 
     size_t offset = 0;
-    int i;
-
     mutex_lock(&buffer_lock);
     memset(dump_buffer, 0, PAGE_SIZE);
 
-    for (i = 0; i < mac_list->len; i++) {
+    for (int i = 0; i < mac_list->len; i++) {
         if (!mac_list->arr[i]) {
             pr_warn("NULL pointer at mac_list->arr[%d]\n", i);
             continue;
@@ -211,7 +208,7 @@ static int init_packet_cache(struct kmem_cache **cache) {
 }
 
 static int enqueue_circ_buf(struct ring_buffer *rb, void *data) {
-    uint32_t next_tail = (rb->tail + 1) % BUF_SIZE;
+    int next_tail = (rb->tail + 1) % BUF_SIZE;
     if(next_tail == rb->head) {
         printk(KERN_WARNING "[tail]ring buffer is full, cannot enqueue data\n");
         return -1;
@@ -240,12 +237,12 @@ static void* dequeue_circ_buf(struct ring_buffer *rb) {
     return data;
 }
 
-static int wq_process_batch(struct work_struct *work_ptr) {//deferred
+static void wq_process_batch(struct work_struct *work_ptr) {//deferred
     struct work_info *w_info = container_of(work_ptr, struct work_info, work);
-    struct ring_buffer *rb = &this_cpu_ptr(percpu_circ_buf);
-    struct kfifo *w_stack = &this_cpu_ptr(worker_stack);
-    spinlock_t *s_lock = &this_cpu_ptr(kfifo_slock);
-    atomic_t *b_counter = &this_cpu_ptr(batch_counter);
+    struct ring_buffer *rb = this_cpu_ptr(&percpu_circ_buf);
+    struct kfifo *w_stack = this_cpu_ptr(&worker_stack);
+    spinlock_t *s_lock = this_cpu_ptr(&kfifo_slock);
+    atomic_t *b_counter = this_cpu_ptr(&batch_counter);
     int start_index = w_info->batch_start;
 
     struct mac_info *mi = kmalloc(sizeof(struct mac_info), GFP_ATOMIC);
@@ -254,13 +251,13 @@ static int wq_process_batch(struct work_struct *work_ptr) {//deferred
         if (!kfifo_put(w_stack, w_info)) {
             spin_unlock(s_lock);
             printk(KERN_ERR "Failed to return worker to stack for CPU %d\n");
-            return -ENOMEM;
+            //return -ENOMEM;
         }
         if(rb->head == -1)
             rb->head = start_index;
         spin_unlock(s_lock);
         printk(KERN_ERR "Failed to allocate memory in batch processor\n");
-        return -ENOMEM;
+        //return -ENOMEM;
     }
 
     for(int i = start_index; i < BATCH_SIZE + start_index; i++) {
@@ -303,16 +300,16 @@ static int wq_process_batch(struct work_struct *work_ptr) {//deferred
     if (!kfifo_put(w_stack, w_info)) {
         spin_unlock(s_lock);
         printk(KERN_ERR "Failed to return worker to stack for CPU %d\n");
-        return -ENOMEM;
+        //return -ENOMEM;
     }
     if(rb->head == -1)
         rb->head = start_index;
     spin_unlock(s_lock);
-    atomic_t s_counter = &this_cpu_ptr(skip_counter);
+    atomic_t *s_counter = this_cpu_ptr(&skip_counter);
     //do smth maybe
     atomic_set(s_counter, 0);
 
-    return 0;
+    //return 0;
 }
 
 static unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state) {
@@ -324,18 +321,18 @@ static unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const s
         return NF_ACCEPT;
     }
 
-    uint32_t proto_hs = ntohs(eth->h_proto);
+    int proto_hs = ntohs(eth_h->h_proto);
     if(!whitelist_proto[proto_hs]) {
         return NF_ACCEPT;
     }
 
-    atomic_t *b_counter = &this_cpu_ptr(batch_counter);
-    struct ring_buffer *rb = &this_cpu_ptr(percpu_circ_buf);
+    atomic_t *b_counter = this_cpu_ptr(&batch_counter);
+    struct ring_buffer *rb = this_cpu_ptr(&percpu_circ_buf);
 
     struct packet_info *p_info = (struct packet_info *)dequeue_circ_buf(rb);
-    if(p_info == -1 || !p_info) {//skip until some worker from workqueue return free in kfifo of available workers
+    if(!p_info) {//skip until some worker from workqueue return free in kfifo of available workers
         //printk(KERN_WARNING "[BUF_FULL] no more space for incoming packet, skipping\n");
-        atomic_inc(&this_cpu_ptr(skip_counter))
+        atomic_inc(this_cpu_ptr(&skip_counter));
         return NF_ACCEPT;
     }
     memcpy(&p_info->eth_h, eth_h, sizeof(struct ethhdr));
@@ -345,8 +342,8 @@ static unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const s
     if(counter % BATCH_SIZE == 0) {
         atomic_set(b_counter, 0);
         //atomic_cmpxchg(b_counter, BUF_SIZE, 0);
-        struct kfifo *w_stack = &this_cpu_ptr(worker_stack);
-        spinlock_t *s_lock = &this_cpu_ptr(kfifo_slock);
+        struct kfifo *w_stack = this_cpu_ptr(&worker_stack);
+        spinlock_t *s_lock = this_cpu_ptr(&kfifo_slock);
 
         struct work_info *worker = NULL;
         spin_lock(s_lock);
@@ -374,14 +371,14 @@ static unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const s
 static int init_per_cpu(void) {
     int cpu, res;
     for_each_possible_cpu(cpu) {
-        struct kmem_cache **cache = &per_cpu(packet_cache, cpu);
+        struct kmem_cache **cache = per_cpu_ptr(&packet_cache, cpu);
         int res = init_packet_cache(cache);
 
         if(res < 0) {
-            return -ENVAL;
+            return -EINVAL;
         }
 
-        struct ring_buffer *rb = &per_cpu(percpu_circ_buf, cpu);
+        struct ring_buffer *rb = per_cpu_ptr(&percpu_circ_buf, cpu);
         rb->head = 0;
         rb->tail = 0;
         for(uint16_t i = 0; i < BUF_SIZE; i++) {
@@ -393,7 +390,7 @@ static int init_per_cpu(void) {
             }
         }
 
-        atomic_t *b_counter = &per_cpu(batch_counter, cpu);
+        atomic_t *b_counter = per_cpu_ptr(&batch_counter, cpu);
         atomic_set(b_counter, 0);
 
         char wq_name[32];
@@ -404,27 +401,28 @@ static int init_per_cpu(void) {
             return -ENOMEM;
         }
 
-        struct workqueue_struct **wq_ptr = &per_cpu(percpu_workqueue, cpu);
-        *wq_ptr = wq;
+        // struct workqueue_struct **wq_ptr = per_cpu_ptr(&percpu_workqueue, cpu);
+        // *wq_ptr = wq;
+        *per_cpu_ptr(&percpu_workqueue, cpu) = wq;
 
-        struct kfifo *w_stack = &per_cpu(worker_stack, cpu);
+        struct kfifo *w_stack = per_cpu_ptr(&worker_stack, cpu);
         res = kfifo_alloc(w_stack, WORKERS_SIZE * sizeof(struct work_info), GFP_KERNEL);
         if (res) {
             printk(KERN_ERR "Failed to allocate kfifo for CPU %d\n", cpu);
             return -1;
         }
 
-        spinlock_t *s_lock = &per_cpu(kfifo_slock, cpu);
+        spinlock_t *s_lock = per_cpu_ptr(&kfifo_slock, cpu);
         spin_lock_init(s_lock);
 
-        spinlock_t *s_counter = &per_cpu(skip_counter, cpu);
+        atomic_t *s_counter = per_cpu_ptr(&skip_counter, cpu);
         atomic_set(s_counter, 0);
 
-        struct work_info *local_workers = per_cpu(wq_workers, cpu);
+        struct work_info *local_workers = per_cpu_ptr(wq_workers, cpu);
         for (int i = 0; i < WORKERS_SIZE; i++) {
             local_workers[i].cpu_id = cpu;
             local_workers[i].batch_start = i * BATCH_SIZE;
-            //local_workers[i].batch_end = local_workers[i].batch_start + BATCH_SIZE;
+
             INIT_WORK(&local_workers[i].work, wq_process_batch);
             if (!kfifo_put(w_stack, &local_workers[i])) {
                 printk(KERN_WARNING "KFIFO full, failed to enqueue worker\n");
@@ -465,7 +463,7 @@ static void clear_slab_caches(void) {
 
 static void clear_workqueues(void) {
     //flush_scheduled_work();
-    cancel_work_sync(&rhash_worker);
+    cancel_delayed_work(&mac_dump_work);
     int cpu;
     for_each_possible_cpu(cpu) { 
         struct work_info *local_workers = per_cpu(wq_workers, cpu);
@@ -473,7 +471,7 @@ static void clear_workqueues(void) {
             cancel_work_sync(&local_workers[i].work);
         }
         
-        destroy_workqueue(per_cpu(percpu_workqueue, cpu));
+        destroy_workqueue(per_cpu_ptr(percpu_workqueue, cpu));
     }
 }
 
@@ -576,7 +574,7 @@ static void __exit logger_exit(void) {
 
     struct rhashtable_iter iter;
     struct mac_info* obj = NULL;
-    atomic_inc(&reader_waiting);
+    //atomic_inc(&reader_waiting);
     read_lock(&rhash_rwlock);
     rhashtable_walk_enter(&rhash_frames, &iter);
     rhashtable_walk_start(&iter);
@@ -597,7 +595,7 @@ static void __exit logger_exit(void) {
     rhashtable_walk_exit(&iter);
 
     read_unlock(&rhash_rwlock);
-    atomic_dec(&reader_waiting);
+    //atomic_dec(&reader_waiting);
 
     for (int i = 0; i < BUF_SIZE; i++) {
         kfree(mac_list->arr[i]);

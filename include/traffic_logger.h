@@ -34,4 +34,4 @@ struct work_info {
 
 static int wq_process_dump(struct work_struct *work_ptr);
 static void clear_slab_caches(void);
-void dump_htable(struct work_struct work*);
+void dump_htable(struct work_struct *work);
