@@ -33,4 +33,6 @@ struct work_info {
 
 static int wq_process_dump(struct work_struct *work_ptr);
 static void clear_slab_caches(void);
+static int packet_rcv(struct sk_buff *skb, struct net_device *dev,
+                      struct packet_type *pt, struct net_device *orig_dev);
 void dump_htable(struct work_struct *work);

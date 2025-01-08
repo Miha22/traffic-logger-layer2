@@ -10,6 +10,9 @@
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/skbuff.h>
+#include <linux/if_packet.h>
+#include <linux/socket.h>
+#include <net/sock.h>
 
 #include <linux/percpu.h>
 #include <linux/slab.h>
@@ -25,7 +28,7 @@
 #include <traffic_logger.h>
 
 static struct rhashtable *rhash_frames;
-static struct nf_hook_ops nfho;
+//static struct nf_hook_ops nfho;
 //static struct mac_list *mac_list;
 //static atomic_t ml_tail = ATOMIC_INIT(0);
 //DEFINE_PER_CPU(struct kmem_cache *, packet_cache);
@@ -485,18 +488,31 @@ static void wq_process_batch(struct work_struct *work_ptr) {//deferred
     //return 0;
 }
 
-unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state) {
-    struct ethhdr* eth_h = eth_hdr(skb);
-    //struct iphdr *ip_h = ip_hdr(skb);  
+static struct packet_type p_type = {
+    .type = htons(ETH_P_ALL),
+    .dev = NULL,
+    .func = packet_rcv
+};
 
+static int packet_rcv(struct sk_buff *skb, struct net_device *dev,
+                      struct packet_type *p_type, struct net_device *orig_dev) {
+    struct ethhdr* eth_h = eth_hdr(skb);
     if(!eth_h) {
         printk(KERN_INFO "failed to capture ethernet or ip header in traffic_logger module\n");
-        return NF_ACCEPT;
+        return NET_RX_SUCCESS;
     }
+
+
+    // if (eth_h) {
+    //     printk(KERN_INFO "SRC MAC: %pM, DST MAC: %pM, Protocol: 0x%04x\n",
+    //            eth_h->h_source, eth_h->h_dest, ntohs(eth_h->h_proto));
+    // }
+
+    // return NET_RX_SUCCESS;
 
     int proto_hs = ntohs(eth_h->h_proto);
     if(!whitelist_proto[proto_hs]) {
-        return NF_ACCEPT;
+        return NET_RX_SUCCESS;
     }
 
     atomic_t *b_counter = this_cpu_ptr(&batch_counter);
@@ -507,7 +523,7 @@ unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct n
     if(!p_info) {//skip until some worker from workqueue return free in kfifo of available workers
         //printk(KERN_WARNING "[BUF_FULL] no more space for incoming packet, skipping\n");
         //atomic_inc(this_cpu_ptr(&skip_counter));
-        return NF_ACCEPT;
+        return NET_RX_SUCCESS;
     }
     memcpy(&p_info->eth_h, eth_h, sizeof(struct ethhdr));
 
@@ -519,7 +535,7 @@ unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct n
         struct kfifo **w_stack_ptr = this_cpu_ptr(&worker_stack);
         if (!w_stack_ptr || !(*w_stack_ptr)) {
             printk(KERN_ERR "[traffic_netdev_hook] kfifo is NULL:%d\n");
-            return NF_ACCEPT;
+            return NET_RX_SUCCESS;
         }
         struct kfifo *w_stack = *w_stack_ptr;
 
@@ -529,7 +545,7 @@ unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct n
         void *worker_ptr;
         if (kfifo_out(w_stack, &worker_ptr, sizeof(void *)) != sizeof(void *)) {
             printk(KERN_WARNING "[traffic_netdev_hook] kfifo is empty, failed to pop worker\n");
-            return NF_ACCEPT;
+            return NET_RX_SUCCESS;
         }
         struct work_info *worker = (struct work_info *)worker_ptr;
         
@@ -543,7 +559,7 @@ unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct n
         // if (!kfifo_get(w_stack, &worker)) {//bandwidth reached
         //     spin_unlock(s_lock);
         //     printk(KERN_WARNING "No free workers available. Consider increasing ring buffer size and batch size\n");
-        //     return NF_ACCEPT;
+        //     return NET_RX_SUCCESS;
         // }
 
         spin_unlock(s_lock);
@@ -554,8 +570,70 @@ unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct n
         }
     }
 
-    return NF_ACCEPT;
+    return NET_RX_SUCCESS;
 }
+
+// unsigned int traffic_netdev_hook(void *priv, struct sk_buff *skb, const struct nf_hook_state *state) {
+//     struct ethhdr* eth_h = eth_hdr(skb);
+//     //struct iphdr *ip_h = ip_hdr(skb);  
+
+//     if(!eth_h) {
+//         printk(KERN_INFO "failed to capture ethernet or ip header in traffic_logger module\n");
+//         return NET_RX_SUCCESS;
+//     }
+
+//     int proto_hs = ntohs(eth_h->h_proto);
+//     if(!whitelist_proto[proto_hs]) {
+//         return NET_RX_SUCCESS;
+//     }
+
+//     atomic_t *b_counter = this_cpu_ptr(&batch_counter);
+//     struct ring_buffer **rb_ptr = this_cpu_ptr(&percpu_circ_buf);
+//     struct ring_buffer *rb = *rb_ptr;
+
+//     struct packet_info *p_info = (struct packet_info *)dequeue_circ_buf(rb);
+//     if(!p_info) {
+//         return NET_RX_SUCCESS;
+//     }
+//     memcpy(&p_info->eth_h, eth_h, sizeof(struct ethhdr));
+
+//     atomic_inc(b_counter);
+//     int counter = atomic_read(b_counter);
+//     if(counter % BATCH_SIZE == 0) {
+//         atomic_set(b_counter, 0);
+//         struct kfifo **w_stack_ptr = this_cpu_ptr(&worker_stack);
+//         if (!w_stack_ptr || !(*w_stack_ptr)) {
+//             printk(KERN_ERR "[traffic_netdev_hook] kfifo is NULL:%d\n");
+//             return NET_RX_SUCCESS;
+//         }
+//         struct kfifo *w_stack = *w_stack_ptr;
+
+//         spinlock_t *s_lock = this_cpu_ptr(&kfifo_slock);
+
+//         spin_lock(s_lock);
+//         void *worker_ptr;
+//         if (kfifo_out(w_stack, &worker_ptr, sizeof(void *)) != sizeof(void *)) {
+//             printk(KERN_WARNING "[traffic_netdev_hook] kfifo is empty, failed to pop worker\n");
+//             return NET_RX_SUCCESS;
+//         }
+//         struct work_info *worker = (struct work_info *)worker_ptr;
+        
+//         void *worker_ptr_next;
+//         if (kfifo_out_peek(w_stack, &worker_ptr_next, sizeof(void *)) != sizeof(void *)) {
+//             rb->head = -1;
+//         } else {
+//             struct work_info *worker_next = (struct work_info *)worker_ptr_next;
+//             rb->head = worker_next->batch_start;
+//         }
+
+//         spin_unlock(s_lock);
+//         if (!schedule_work_on(worker->cpu_id, &worker->work)) {
+//             printk(KERN_WARNING "Failed to queue work in workqueue\n");
+//         }
+//     }
+
+//     return NET_RX_SUCCESS;
+// }
 
 static int init_per_cpu(void) {
     int cpu;
@@ -666,25 +744,25 @@ static int init_per_cpu(void) {
     return 0;
 }
 
-static int init_hook(struct nf_hook_ops *nfhoptr, 
-                    unsigned int (*hook_cb)(void*, struct sk_buff*, const struct nf_hook_state *), 
-                    uint8_t protocol, 
-                    uint32_t routing, 
-                    int32_t priority
-                ) {
-    if (!hook_cb) {
-        printk(KERN_ERR "bad hook configuration passed in params\n");
-        return -EINVAL;
-    }
+// static int init_hook(struct nf_hook_ops *nfhoptr, 
+//                     unsigned int (*hook_cb)(void*, struct sk_buff*, const struct nf_hook_state *), 
+//                     uint8_t protocol, 
+//                     uint32_t routing, 
+//                     int32_t priority
+//                 ) {
+//     if (!hook_cb) {
+//         printk(KERN_ERR "bad hook configuration passed in params\n");
+//         return -EINVAL;
+//     }
 
-    nfho.hook = (nf_hookfn*)hook_cb;
-    nfho.dev = NULL;
-    nfho.pf = protocol;
-    nfho.hooknum = routing;
-    nfho.priority = priority;
+//     nfho.hook = (nf_hookfn*)hook_cb;
+//     nfho.dev = NULL;
+//     nfho.pf = protocol;
+//     nfho.hooknum = routing;
+//     nfho.priority = priority;
     
-    return 0;
-}
+//     return 0;
+// }
 
 static void free_ringbuffers(void) {
     int cpu;
@@ -809,6 +887,14 @@ static int __init logger_init(void) {
         printk(KERN_ERR "Error initializing hashtable: %d\n", ret);
         return ret;
     }
+    dev_add_pack(&p_type);
+    // if (ret) {
+    //     cancel_workers();
+    //     free_kfifo();
+    //     free_ringbuffers();
+    //     printk(KERN_ERR "Error registering packet socket\n");
+    //     return ret;
+    // }
     // ret = init_hook(&nfho, traffic_netdev_hook, NFPROTO_NETDEV, NF_NETDEV_INGRESS, NF_IP_PRI_FIRST);
     // if (ret < 0) {
     //     printk(KERN_ERR "Failed to register hook err: %d\n", ret);
@@ -823,28 +909,29 @@ static int __init logger_init(void) {
     // nfho.hooknum = NF_INET_PRE_ROUTING;
     // nfho.priority = NF_IP_PRI_FIRST;
 
-    nfho.hook = traffic_netdev_hook;
-    nfho.pf = NFPROTO_NETDEV;
-    nfho.hooknum = NF_NETDEV_INGRESS;
-    nfho.priority = NF_IP_PRI_FIRST;
+    // nfho.hook = traffic_netdev_hook;
+    // nfho.pf = NFPROTO_NETDEV;
+    // nfho.hooknum = NF_NETDEV_INGRESS;
+    // nfho.priority = NF_IP_PRI_FIRST;
 
-        printk(KERN_INFO "nfho: hook=%p, hooknum=%d, pf=%d, priority=%d\n", 
-    nfho.hook, nfho.hooknum, nfho.pf, nfho.priority);
-    ret = nf_register_net_hook(&init_net, &nfho); 
-    if (ret < 0) {
-        cancel_workers();
-        free_kfifo();
-        free_ringbuffers();
-        // for (uint32_t j = 0; j < BUF_SIZE; j++) {
-        //     kfree(mac_list->arr[j]);
-        // }
-        //kfree(mac_list);
-        //kfree(nfho);
-        printk(KERN_ERR "Failed to register hook: %d\n", ret);
-        return ret;
-    }
+    //     printk(KERN_INFO "nfho: hook=%p, hooknum=%d, pf=%d, priority=%d\n", 
+    // nfho.hook, nfho.hooknum, nfho.pf, nfho.priority);
+    // ret = nf_register_net_hook(&init_net, &nfho); 
+    // if (ret < 0) {
+    //     cancel_workers();
+    //     free_kfifo();
+    //     free_ringbuffers();
+    //     // for (uint32_t j = 0; j < BUF_SIZE; j++) {
+    //     //     kfree(mac_list->arr[j]);
+    //     // }
+    //     //kfree(mac_list);
+    //     //kfree(nfho);
+    //     printk(KERN_ERR "Failed to register hook: %d\n", ret);
+    //     return ret;
+    // }
     if(init_delayed_dump() < 0) {
-        nf_unregister_net_hook(&init_net, &nfho);
+        //nf_unregister_net_hook(&init_net, &nfho);
+        dev_remove_pack(&p_type);
         cancel_delayed_work_sync(&mac_dump_work);
         cancel_workers();
         free_kfifo();
@@ -918,7 +1005,7 @@ static int __init logger_init(void) {
 }
 
 static void __exit logger_exit(void) {
-    nf_unregister_net_hook(&init_net, &nfho);
+    dev_remove_pack(&p_type);
     cancel_delayed_work_sync(&mac_dump_work);
     cancel_workers();
     free_kfifo();
