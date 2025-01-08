@@ -94,56 +94,56 @@ void dump_htable(struct work_struct *work) {
 
     rcu_read_lock();
     
-    rhashtable_walk_enter(&rhash_frames, &iter);
-    rhashtable_walk_start(&iter);
-    uint32_t i = 0;
-    while (i < BUF_SIZE && (obj = (struct mac_info*)rhashtable_walk_next(&iter)) != NULL) {
-        if (IS_ERR(obj)) {
-            printk(KERN_ERR "Error encountered while iterating hash table\n");
-            continue;
-        }
+    // rhashtable_walk_enter(&rhash_frames, &iter);
+    // rhashtable_walk_start(&iter);
+    // uint32_t i = 0;
+    // while (i < BUF_SIZE && (obj = (struct mac_info*)rhashtable_walk_next(&iter)) != NULL) {
+    //     if (IS_ERR(obj)) {
+    //         printk(KERN_ERR "Error encountered while iterating hash table\n");
+    //         continue;
+    //     }
             
-        memcpy(mac_list->arr[i], obj->src_mac, ETH_ALEN);
-        if(rhashtable_remove_fast(&rhash_frames, &obj->linkage, object_params) == 0)
-            kfree_rcu(obj, r_head);
-        else {
-            printk(KERN_WARNING "Cannot remove object from rhashtable");
-        }
-        i++;
-    }
-    mac_list->len = i;
+    //     memcpy(mac_list->arr[i], obj->src_mac, ETH_ALEN);
+    //     if(rhashtable_remove_fast(&rhash_frames, &obj->linkage, object_params) == 0)
+    //         kfree_rcu(obj, r_head);
+    //     else {
+    //         printk(KERN_WARNING "Cannot remove object from rhashtable");
+    //     }
+    //     i++;
+    // }
+    // mac_list->len = i;
 
-    rhashtable_walk_stop(&iter);
-    rhashtable_walk_exit(&iter);
-    rcu_read_unlock();
-    synchronize_rcu();
+    // rhashtable_walk_stop(&iter);
+    // rhashtable_walk_exit(&iter);
+    // rcu_read_unlock();
+    // synchronize_rcu();
 
     size_t offset = 0;
     mutex_lock(&buffer_lock);
     memset(dump_buffer, 0, PAGE_SIZE);
 
-    for (int i = 0; i < mac_list->len; i++) {
-        if (!mac_list->arr[i]) {
-            pr_warn("NULL pointer at mac_list->arr[%d]\n", i);
-            continue;
-        }
+    // for (int i = 0; i < mac_list->len; i++) {
+    //     if (!mac_list->arr[i]) {
+    //         pr_warn("NULL pointer at mac_list->arr[%d]\n", i);
+    //         continue;
+    //     }
 
-        offset += scnprintf(dump_buffer + offset, PAGE_SIZE - offset,
-                            "%02x:%02x:%02x:%02x:%02x:%02x\n",
-                            mac_list->arr[i][0], mac_list->arr[i][1], mac_list->arr[i][2],
-                            mac_list->arr[i][3], mac_list->arr[i][4], mac_list->arr[i][5]);
+    //     offset += scnprintf(dump_buffer + offset, PAGE_SIZE - offset,
+    //                         "%02x:%02x:%02x:%02x:%02x:%02x\n",
+    //                         mac_list->arr[i][0], mac_list->arr[i][1], mac_list->arr[i][2],
+    //                         mac_list->arr[i][3], mac_list->arr[i][4], mac_list->arr[i][5]);
 
-        if (offset >= PAGE_SIZE) {
-            pr_warn("MAC dump truncated due to buffer size\n");
-            break;
-        }
-    }
-    buffer_len = offset;
+    //     if (offset >= PAGE_SIZE) {
+    //         pr_warn("MAC dump truncated due to buffer size\n");
+    //         break;
+    //     }
+    // }
+    buffer_len = 111;
     mac_list->len = 0;
 
     mutex_unlock(&buffer_lock);
 
-    printk(KERN_INFO "Periodic MAC dump completed and accounting reset (%zu bytes).\n", buffer_len);
+    printk(KERN_INFO "Periodic MAC dump completed and accounting reset (%zu bytes).\n", 111);
     schedule_delayed_work(&mac_dump_work, msecs_to_jiffies(DUMP_PERIOD));
     // atomic_inc(&reader_waiting);
     // read_lock(&rhash_rwlock);
@@ -154,6 +154,73 @@ void dump_htable(struct work_struct *work) {
     // atomic_dec(&reader_waiting);
     // wake_up_all(&writers_wq);
 }
+
+// void dump_htable(struct work_struct *work) {
+//     struct rhashtable_iter iter;
+//     struct mac_info* obj = NULL;
+
+//     rcu_read_lock();
+    
+//     rhashtable_walk_enter(&rhash_frames, &iter);
+//     rhashtable_walk_start(&iter);
+//     uint32_t i = 0;
+//     while (i < BUF_SIZE && (obj = (struct mac_info*)rhashtable_walk_next(&iter)) != NULL) {
+//         if (IS_ERR(obj)) {
+//             printk(KERN_ERR "Error encountered while iterating hash table\n");
+//             continue;
+//         }
+            
+//         memcpy(mac_list->arr[i], obj->src_mac, ETH_ALEN);
+//         if(rhashtable_remove_fast(&rhash_frames, &obj->linkage, object_params) == 0)
+//             kfree_rcu(obj, r_head);
+//         else {
+//             printk(KERN_WARNING "Cannot remove object from rhashtable");
+//         }
+//         i++;
+//     }
+//     mac_list->len = i;
+
+//     rhashtable_walk_stop(&iter);
+//     rhashtable_walk_exit(&iter);
+//     rcu_read_unlock();
+//     synchronize_rcu();
+
+//     size_t offset = 0;
+//     mutex_lock(&buffer_lock);
+//     memset(dump_buffer, 0, PAGE_SIZE);
+
+//     for (int i = 0; i < mac_list->len; i++) {
+//         if (!mac_list->arr[i]) {
+//             pr_warn("NULL pointer at mac_list->arr[%d]\n", i);
+//             continue;
+//         }
+
+//         offset += scnprintf(dump_buffer + offset, PAGE_SIZE - offset,
+//                             "%02x:%02x:%02x:%02x:%02x:%02x\n",
+//                             mac_list->arr[i][0], mac_list->arr[i][1], mac_list->arr[i][2],
+//                             mac_list->arr[i][3], mac_list->arr[i][4], mac_list->arr[i][5]);
+
+//         if (offset >= PAGE_SIZE) {
+//             pr_warn("MAC dump truncated due to buffer size\n");
+//             break;
+//         }
+//     }
+//     buffer_len = offset;
+//     mac_list->len = 0;
+
+//     mutex_unlock(&buffer_lock);
+
+//     printk(KERN_INFO "Periodic MAC dump completed and accounting reset (%zu bytes).\n", buffer_len);
+//     schedule_delayed_work(&mac_dump_work, msecs_to_jiffies(DUMP_PERIOD));
+//     // atomic_inc(&reader_waiting);
+//     // read_lock(&rhash_rwlock);
+
+//     // //reset table
+
+//     // read_unlock(&rhash_rwlock);
+//     // atomic_dec(&reader_waiting);
+//     // wake_up_all(&writers_wq);
+// }
 
 static int init_delayed_dump(void) {
     proc_file = proc_create("mac_dump", 0, NULL, &proc_fops);
@@ -423,8 +490,16 @@ static int init_per_cpu(void) {
                 printk(KERN_ERR "[kmalloc] Cannot allocate memory for packet during init due to ring buffer error\n");
                 return -1;
             }
+
+            // struct mac_info *mi = kmalloc(sizeof(struct mac_info), GFP_KERNEL);
+            // if(!mi) {
+            //     printk(KERN_ERR "[kmalloc] Cannot create memory for macinfo during on cpu:%d\n", cpu);
+            //     return -1;
+            // }
+            
             //res = enqueue_circ_buf(*rb, p_info);
             (*rb)->buffer[i] = p_info;
+
             printk(KERN_INFO "[ok] memory for 'ring' buffer[%d] on cpu:%d\n", i, cpu);
             // if(res < 0) {
             //     printk(KERN_ERR "Cannot allocate cache for packet during init due to ring buffer error\n");
@@ -599,7 +674,10 @@ static int __init logger_init(void) {
     }
     for (uint32_t i = 0; i < BUF_SIZE; i++) {
         mac_list->arr[i] = kmalloc(ETH_ALEN, GFP_KERNEL);
-        if (mac_list->arr[i] == NULL) {
+        unsigned char bytes[ETH_ALEN] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+        unsigned char bytes2[ETH_ALEN] = { 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB };
+        memcpy(mac_list->arr[i], (i % 2 == 0 ? bytes2 : bytes), ETH_ALEN);
+        if (!mac_list->arr[i]) {
             printk(KERN_ERR "Failed to allocate memory for mac_list->arr[%d]\n", i);
             for (int j = 0; j < i; j++) {
                 kfree(mac_list->arr[j]);
@@ -649,8 +727,8 @@ static int __init logger_init(void) {
     //     return ret;
     // }
     // if(init_delayed_dump() < 0) {
-    //     nf_unregister_net_hook(&init_net, nfho);
-    //     cancel_delayed_work_sync(&mac_dump_work);
+    //     //nf_unregister_net_hook(&init_net, nfho);
+    //     //cancel_delayed_work_sync(&mac_dump_work);
     //     cancel_workers();
     //     free_kfifo();
     //     clear_slab_caches();
@@ -670,7 +748,7 @@ static int __init logger_init(void) {
 
 static void __exit logger_exit(void) {
     // nf_unregister_net_hook(&init_net, nfho);
-    // cancel_delayed_work_sync(&mac_dump_work);
+    //cancel_delayed_work_sync(&mac_dump_work);
     cancel_workers();
     free_kfifo();
     clear_slab_caches();
