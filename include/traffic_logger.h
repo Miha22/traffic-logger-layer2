@@ -29,7 +29,7 @@ struct packet_info {
 struct work_info {
     struct work_struct work;
     int cpu_id;
-	int batch_start;
+	uint32_t batch_start;
 };
 
 static int wq_process_dump(struct work_struct *work_ptr);
