@@ -5,6 +5,6 @@
 
 struct ring_buffer {
     void *buffer[BUF_SIZE];
-    int head;
-    int tail;
+    signed long int head;//yes long
+    uint32_t tail;//yes uint
 };

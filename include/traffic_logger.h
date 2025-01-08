@@ -8,16 +8,15 @@
 #define MAC_SIZE 18 // 11 22 33 44 55 66 = 12 + 5 + 1 = 18 chars
 
 struct mac_info {
-	int key;
-    unsigned char src_mac[ETH_ALEN];
+	unsigned char src_mac_key[ETH_ALEN];
 	struct rhash_head linkage;
-	// uint32_t counter;
+    unsigned char src_mac[ETH_ALEN];
 	refcount_t ref;
-	struct rcu_head r_head;
+	struct rcu_head rcu_read;
 };
 
 struct mac_list {
-	unsigned char *arr[BUF_SIZE];
+	unsigned char arr[BUF_SIZE][ETH_ALEN];
 	uint32_t len;
 };
 
@@ -29,9 +28,11 @@ struct packet_info {
 struct work_info {
     struct work_struct work;
     int cpu_id;
-	int batch_start;
+	uint32_t batch_start;
 };
 
 static int wq_process_dump(struct work_struct *work_ptr);
 static void clear_slab_caches(void);
+static int packet_rcv(struct sk_buff *skb, struct net_device *dev,
+                      struct packet_type *pt, struct net_device *orig_dev);
 void dump_htable(struct work_struct *work);
