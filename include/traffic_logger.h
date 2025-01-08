@@ -8,14 +8,15 @@
 #define MAC_SIZE 18 // 11 22 33 44 55 66 = 12 + 5 + 1 = 18 chars
 
 struct mac_info {
+	unsigned char src_mac_key[ETH_ALEN];
 	struct rhash_head linkage;
     unsigned char src_mac[ETH_ALEN];
 	refcount_t ref;
-	struct rcu_head r_head;
-};//[  597.628502] object_params: key len=6, key offset=4, head offset=0
+	struct rcu_head rcu_read;
+};
 
 struct mac_list {
-	unsigned char *arr[BUF_SIZE];
+	unsigned char arr[BUF_SIZE][ETH_ALEN];
 	uint32_t len;
 };
 
